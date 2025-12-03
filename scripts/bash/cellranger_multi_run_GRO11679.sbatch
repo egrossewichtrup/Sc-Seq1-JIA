@@ -11,7 +11,7 @@ set -euo pipefail
 
 # --- 1) PROJECT ROOT + DATED RUN FOLDER ---
 # Your fixed analysis directory:
-PROJ="/hpc/dla_lti/yermanos_group/GRO11679/analysis_20250925_140348"
+PROJ="/hpc/dla_lti/yermanos_group/GRO11679/alignment_CR"
 RUN_DATE="$(date +%F)"              # e.g., 2025-10-30
 RUN_ROOT="${PROJ}/cellranger_multi_${RUN_DATE}"   # e.g., .../cellranger_multi_2025-10-30
 
@@ -21,7 +21,7 @@ mkdir -p "${RUN_ROOT}" "${PROJ}/logs"
 CR_BIN="/hpc/dla_lti/yermanos_group/software/cellranger-9.0.1/bin"
 REF_GEX="/hpc/dla_lti/yermanos_group/REF_GEX/refdata-gex-GRCh38-2024-A"
 REF_VDJ="/hpc/dla_lti/yermanos_group/REF_VDJ/refdata-cellranger-vdj-GRCh38-alts-ensembl-7.1.0"
-FEATURE_REF="${PROJ}/feature_ref/featurebarcode.csv"
+FEATURE_REF="/hpc/dla_lti/yermanos_group/GRO11679/alignment_CR/feature_ref/featurebarcode.csv"
 
 FASTQ_A="/hpc/dla_lti/yermanos_group/GRO11679/fastq/A235V25LT3"
 FASTQ_B="/hpc/dla_lti/yermanos_group/GRO11679/fastq/B22WFC2LT3"
@@ -80,3 +80,4 @@ cd "${outdir}"
 
 
 # Submit with sbatch /hpc/dla_lti/yermanos_group/GRO11679/analysis_20250925_140348/scripts/cellranger_multi_run_GRO11679.sbatch
+

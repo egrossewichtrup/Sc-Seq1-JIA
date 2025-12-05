@@ -4,10 +4,13 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --chdir=/hpc/dla_lti/yermanos_group/GRO11679
-#SBATCH --output=%x_%j.out
-#SBATCH --error=%x_%j.err
+#SBATCH --output=/hpc/dla_lti/yermanos_group/GRO11679/logs/%x_%j.out
+#SBATCH --error=/hpc/dla_lti/yermanos_group/GRO11679/logs/%x_%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=egrossewichtrup@umcutrecht.nl
+
+
+#This script takes approx. 1 minute to run
 
 set -euo pipefail
 
@@ -25,10 +28,16 @@ GENETIC_ROOT="${PROJ_MAIN}/genetic_demultiplexing"
 # If you want to force a specific run, you can set these.
 # If they are left empty, the script auto-detects the newest.
 HS_CSV=""   # e.g. "/.../demultiplexing/hashsolo/20251114_132635_hashsolo_C1_C6_C8_C9_C10/hashsolo_cells_full.csv"
-SP_ROOT=""  # e.g. "/.../genetic_demultiplexing/demux/genetic_demultiplexing_20251119_144453"
+SP_ROOT="/hpc/dla_lti/yermanos_group/GRO11679/genetic_demultiplexing/demux/genetic_demultiplexing_20251123_140314"  # e.g. "/.../genetic_demultiplexing/demux/genetic_demultiplexing_20251119_144453"
 
-# Only process C1
-CAPTURES="C1"
+# Captures to process (Souporcell capture IDs)
+CAPTURES="C2"
+
+# If Souporcell and HashSolo/captures.tsv use different capture IDs,
+# define a mapping here: "souporcellID=hashsoloID souporcellID2=hashsoloID2"
+# Leave empty if not needed.
+# Example for your case: C2 in Souporcell = C6 in HashSolo/captures.tsv
+CAPTURE_REMAP="C2=C6"
 
 # Confidence threshold for hashsolo singlets
 CONF_T="0.90"
@@ -53,10 +62,12 @@ if [[ -z "$HS_CSV" ]]; then
 fi
 
 if [[ -z "$SP_ROOT" ]]; then
-  log "SP_ROOT not set – auto-detecting latest C1_souporcell under ${GENETIC_ROOT}"
-  C1_DIR=$(find "${GENETIC_ROOT}" -maxdepth 6 -type d -name "C1_souporcell" 2>/dev/null | sort | tail -n1 || true)
-  if [[ -n "$C1_DIR" ]]; then
-    SP_ROOT="$(dirname "$C1_DIR")"
+  # use first capture in CAPTURES list
+  FIRST_CAP="${CAPTURES%% *}"
+  log "SP_ROOT not set – auto-detecting latest ${FIRST_CAP}_souporcell under ${GENETIC_ROOT}"
+  CAP_DIR=$(find "${GENETIC_ROOT}" -maxdepth 6 -type d -name "${FIRST_CAP}_souporcell" 2>/dev/null | sort | tail -n1 || true)
+  if [[ -n "$CAP_DIR" ]]; then
+    SP_ROOT="$(dirname "$CAP_DIR")"
   fi
 fi
 
@@ -87,13 +98,15 @@ if [[ -z "${SP_ROOT:-}" || ! -d "$SP_ROOT" ]]; then
 fi
 
 log "Confirmed:"
-log "  HS_CSV   = $HS_CSV"
-log "  SP_ROOT  = $SP_ROOT"
-log "  CAPTURES = $CAPTURES"
-log "  R_BIN    = $R_BIN"
+log "  HS_CSV        = $HS_CSV"
+log "  SP_ROOT       = $SP_ROOT"
+log "  CAPTURES      = $CAPTURES"
+log "  CAPTURE_REMAP = ${CAPTURE_REMAP:-<none>}"
+log "  R_BIN         = $R_BIN"
 
-log "Listing C1_souporcell under SP_ROOT:"
-ls -ld "$SP_ROOT"/C1_souporcell* || true
+FIRST_CAP="${CAPTURES%% *}"
+log "Listing ${FIRST_CAP}_souporcell under SP_ROOT:"
+ls -ld "$SP_ROOT"/"${FIRST_CAP}"_souporcell* || true
 
 ########################################
 # 3. Derive CAPTURE_CFG_TSV            #
@@ -157,6 +170,7 @@ OUT_ROOT       <- Sys.getenv("OUT_ROOT")
 CAPS_ENV       <- Sys.getenv("CAPTURES")
 CAPTURE_CFG    <- Sys.getenv("CAPTURE_CFG_TSV")
 CONF_T         <- as.numeric(Sys.getenv("CONF_T", "0.90"))
+CAPTURE_REMAP  <- Sys.getenv("CAPTURE_REMAP", "")
 
 message("[INFO] HS_CSV        env: ", HS_CSV)
 message("[INFO] SP_ROOT       env: ", SP_ROOT)
@@ -164,6 +178,7 @@ message("[INFO] OUT_ROOT      env: ", OUT_ROOT)
 message("[INFO] CAPTURES      env: ", CAPS_ENV)
 message("[INFO] CAPTURE_CFG   env: ", CAPTURE_CFG)
 message("[INFO] CONF_T        env: ", CONF_T)
+message("[INFO] CAPTURE_REMAP env: ", CAPTURE_REMAP)
 
 stopifnot(HS_CSV != "", file.exists(HS_CSV))
 stopifnot(SP_ROOT != "", dir.exists(SP_ROOT))
@@ -176,6 +191,19 @@ if (length(captures) == 0) stop("No captures parsed from CAPTURES env")
 
 dir.create(OUT_ROOT, recursive = TRUE, showWarnings = FALSE)
 message("[INFO] Will process captures: ", paste(captures, collapse = ", "))
+
+# ---- optional remap Souporcell capture IDs -> HashSolo/captures.tsv IDs ----
+parse_remap <- function(s) {
+  if (s == "") return(setNames(character(0), character(0)))
+  parts <- strsplit(s, "[[:space:]]+")[[1]]
+  parts <- parts[parts != ""]
+  kv <- strsplit(parts, "=", fixed = TRUE)
+  keys <- vapply(kv, function(x) x[1], character(1))
+  vals <- vapply(kv, function(x) x[2], character(1))
+  setNames(vals, keys)   # names = Souporcell IDs, values = HashSolo/config IDs
+}
+
+cap_remap <- parse_remap(CAPTURE_REMAP)
 
 # ---- load capture config and build HTO→sample maps ----
 cfg <- readr::read_tsv(
@@ -228,6 +256,7 @@ hs <- hs %>%
 annotate_capture <- function(cap_id) {
   message("---- Processing capture ", cap_id, " ----")
 
+  # Souporcell directory uses cap_id (e.g. C2)
   sp_dir  <- file.path(SP_ROOT, paste0(cap_id, "_souporcell"))
   sp_file <- file.path(sp_dir, "clusters.tsv")
 
@@ -235,6 +264,11 @@ annotate_capture <- function(cap_id) {
     warning("No clusters.tsv for ", cap_id, " at ", sp_file)
     return(NULL)
   }
+
+  # Remap to HashSolo/captures.tsv ID if needed
+  hs_cap_id <- if (cap_id %in% names(cap_remap)) cap_remap[[cap_id]] else cap_id
+  message("[INFO] Using HashSolo/config capture ID '", hs_cap_id,
+          "' for Souporcell capture '", cap_id, "'")
 
   message("[INFO] Reading Souporcell clusters: ", sp_file)
   sp <- readr::read_tsv(sp_file, col_types = cols(.default = col_character()))
@@ -257,16 +291,17 @@ annotate_capture <- function(cap_id) {
       cluster_id   = as.character(assignment)
     )
 
-  # ---- HashSolo for this capture ----
+  # ---- HashSolo for this (possibly remapped) capture ----
   hs_cap <- hs %>%
-    filter(`__capture__` == cap_id)
+    filter(`__capture__` == hs_cap_id)
 
   if (nrow(hs_cap) == 0) {
-    warning("No HashSolo rows for capture ", cap_id)
+    warning("No HashSolo rows for capture ", hs_cap_id,
+            " (Souporcell capture: ", cap_id, ")")
     return(NULL)
   }
 
-  message("[INFO] Total HashSolo rows for ", cap_id, ": ", nrow(hs_cap))
+  message("[INFO] Total HashSolo rows for ", hs_cap_id, ": ", nrow(hs_cap))
 
   # define confident singlets from hashsolo
   hs_cap <- hs_cap %>%
@@ -293,21 +328,25 @@ annotate_capture <- function(cap_id) {
   hs_cap_conf <- hs_cap %>% filter(is_conf)
 
   if (nrow(hs_cap_conf) == 0) {
-    warning("No confident HashSolo singlets for capture ", cap_id)
+    warning("No confident HashSolo singlets for capture ", hs_cap_id,
+            " (Souporcell capture: ", cap_id, ")")
     return(NULL)
   }
 
-  message("[INFO] Confident HashSolo singlets for ", cap_id, ": ", nrow(hs_cap_conf))
+  message("[INFO] Confident HashSolo singlets for ", hs_cap_id, ": ",
+          nrow(hs_cap_conf))
 
   # ---- map HTO -> patient/sample_short using capture config ----
-  if (!cap_id %in% names(map_short_list)) {
-    warning("No map_short entry for capture ", cap_id, " in captures.tsv")
+  if (!hs_cap_id %in% names(map_short_list)) {
+    warning("No map_short entry for capture ", hs_cap_id,
+            " in captures.tsv (Souporcell capture: ", cap_id, ")")
     return(NULL)
   }
-  hto_map <- map_short_list[[cap_id]]  # named vector: HTO1 -> HC001 etc.
+  hto_map <- map_short_list[[hs_cap_id]]  # named vector: HTO1 -> HC001 etc.
 
   if (length(hto_map) == 0) {
-    warning("Empty HTO map for capture ", cap_id, " in captures.tsv")
+    warning("Empty HTO map for capture ", hs_cap_id,
+            " in captures.tsv (Souporcell capture: ", cap_id, ")")
     return(NULL)
   }
 
@@ -320,15 +359,17 @@ annotate_capture <- function(cap_id) {
     )
 
   if (all(is.na(hs_cap_conf$sample_short))) {
-    warning("All sample_short are NA for ", cap_id, " – HTO names may not match map_short")
+    warning("All sample_short are NA for HashSolo capture ", hs_cap_id,
+            " (Souporcell capture: ", cap_id,
+            ") – HTO names may not match map_short")
     return(NULL)
   }
 
   # keep only those with a mapped sample_short
   hs_cap_conf <- hs_cap_conf %>% filter(!is.na(sample_short))
 
-  message("[INFO] Confident singlets with mapped sample_short for ", cap_id, ": ",
-          nrow(hs_cap_conf))
+  message("[INFO] Confident singlets with mapped sample_short for Souporcell ",
+          cap_id, " / HashSolo ", hs_cap_id, ": ", nrow(hs_cap_conf))
 
   # ---- join Souporcell clusters with HashSolo sample_short ----
   joined <- sp %>%
@@ -340,11 +381,13 @@ annotate_capture <- function(cap_id) {
     count(cluster_id, sample_short, name = "n_cells")
 
   if (nrow(tab) == 0) {
-    warning("No overlapping barcodes between Souporcell and HashSolo for ", cap_id)
+    warning("No overlapping barcodes between Souporcell (", cap_id,
+            ") and HashSolo (", hs_cap_id, ")")
     return(NULL)
   }
 
-  message("[INFO] Contingency table rows for ", cap_id, ": ", nrow(tab))
+  message("[INFO] Contingency table rows for Souporcell ",
+          cap_id, " / HashSolo ", hs_cap_id, ": ", nrow(tab))
 
   mapping <- tab %>%
     group_by(cluster_id) %>%
@@ -362,6 +405,7 @@ annotate_capture <- function(cap_id) {
   sp_annot <- sp %>%
     left_join(mapping, by = "cluster_id")
 
+  # Output directory still uses Souporcell capture ID (cap_id)
   out_dir <- file.path(OUT_ROOT, cap_id)
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -388,13 +432,14 @@ TS="$(date +%Y%m%d_%H%M%S)"
 OUT_ROOT="${SP_ROOT}/souporcell_with_patient_${TS}"
 mkdir -p "$OUT_ROOT"
 
-export HS_CSV SP_ROOT OUT_ROOT CAPTURES CAPTURE_CFG_TSV CONF_T
+export HS_CSV SP_ROOT OUT_ROOT CAPTURES CAPTURE_CFG_TSV CONF_T CAPTURE_REMAP
 
 log "Running R script with:"
 log "  HS_CSV          = $HS_CSV"
 log "  SP_ROOT         = $SP_ROOT"
 log "  OUT_ROOT        = $OUT_ROOT"
 log "  CAPTURES        = $CAPTURES"
+log "  CAPTURE_REMAP   = ${CAPTURE_REMAP:-<none>}"
 log "  CAPTURE_CFG_TSV = $CAPTURE_CFG_TSV"
 log "  CONF_T          = $CONF_T"
 

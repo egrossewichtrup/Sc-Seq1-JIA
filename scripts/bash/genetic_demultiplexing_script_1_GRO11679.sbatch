@@ -27,7 +27,7 @@ CR_RUN_ROOT="/hpc/dla_lti/yermanos_group/GRO11679/alignment_CR/cellranger_multi_
 MINIFORGE_ROOT="/hpc/dla_lti/yermanos_group/software/venvs4/miniforge3"
 CONDA_ENV_PATH="/hpc/dla_lti/yermanos_group/software/venvs4/souporcell"
 
-# >>> Captures + K values (same length, same order) <<<
+# >>> Captures + K values (same length, same order, multiple possible) <<<
 CAPTURE_IDS=(C1 C6)
 K_VALUES=(2  2)
 

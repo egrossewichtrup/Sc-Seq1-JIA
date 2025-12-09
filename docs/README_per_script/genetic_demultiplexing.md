@@ -1,127 +1,121 @@
-# Genetic demultiplexing and patient annotation (GRO11679)
+# Genetic Demultiplexing – GRO11679 (Souporcell + HashSolo)
 
-Here I described three SLURM-ready bash scripts to run a full genetic demultiplexing workflow for 10x single-cell data using **Souporcell**, link genetic clusters to **hash-tag oligo (HTO)** patient IDs, and generate QC barplots.
+This README describes how to use the two scripts for genetic demultiplexing with Souporcell, annotation with HashSolo, and plotting for project **GRO11679**.
 
-1. genetic_demultiplexing_script_1_GRO11679.sbatch
-2. genetic_demultiplexing_script_2_patient_annotation_GRO11679.sbatch
-3. plot_souporcell_barplot.sbatch
+Scripts:
+- **Script 1 (Souporcell launcher):** `genetic_demultiplexing_script_1_GRO11679.sbatch`
+- **Script 2 (Annotation + plotting):** `genetic_demultiplexing_script_2_annotation_and_plot__from_HS_GRO11679`
 
-The scripts are written for a GRO11679-style project structure on an HPC, but paths and parameters can be adapted to other setups.
+--------------------------------------------------------------------------------
+## 1. Overview
 
----
+1. **Run Souporcell on each capture**  
+   Script 1 is a *launcher* run on the login node. It creates and submits a Slurm **array** job to run Souporcell for each capture (C1, C6, …).
 
-## Overview of scripts
+2. **Annotate Souporcell clusters with HashSolo and plot**  
+   Script 2 is submitted with `sbatch`. It:
+   - Links Souporcell clusters to HashSolo singlet calls and patient IDs.
+   - Writes annotated tables.
+   - Generates per-capture barplots (cells per Souporcell cluster, coloured by patient).
 
-### 1. `genetic_demultiplexing_script_1_GRO11679.sbatch`
+--------------------------------------------------------------------------------
+## 2. Requirements
 
-Launcher script that:
+- SLURM-based HPC cluster.
+- Working **Souporcell** environment:
+  - `MINIFORGE_ROOT` and `CONDA_ENV_PATH` with:
+    - `souporcell_pipeline.py`
+    - `samtools`
+- Working **R** environment:
+  - `R_BIN` pointing to an Rscript executable.
+  - R packages: `readr`, `dplyr`, `stringr`, `purrr`, `ggplot2`.
+- Completed upstream runs:
+  - **Cell Ranger multi** runs per capture under `CR_RUN_ROOT`.
+  - **HashSolo** run providing `hashsolo_cells_full.csv`.
+  - A `captures.tsv` file mapping HTOs to sample IDs.
 
-- Locates the 10x BAM + barcodes for a given capture (`CAPTURE_ID`)
-- Submits a **Souporcell** job via an auto-generated `sbatch` file
-- Organises all outputs under:
+--------------------------------------------------------------------------------
+## 3. Script 1 – Run Souporcell per capture
 
-    ${PROJ}/demux/genetic_demultiplexing_<timestamp>/
-        └─ <CAPTURE_ID>_souporcell/
+**File:** `genetic_demultiplexing_script_1_GRO11679.sbatch`  
+**Run:** on the login node via `bash`, **not** with `sbatch`.
 
-Key settings inside the script:
+### 3.1. Key user settings to edit
 
-- DEMUX_ROOT / PROJ: root directory for this genetic demultiplexing project  
-- REF_FASTA: GRCh38 reference FASTA for Souporcell  
-- CR_RUN_ROOT: Cell Ranger multi BAM root (multi_<CAPTURE_ID>_bam)  
-- MINIFORGE_ROOT / CONDA_ENV_PATH: conda/Miniforge env with Souporcell + samtools  
-- CAPTURE_ID: capture to process (default C1)  
-- K: number of donors (clusters) for Souporcell (default 2)  
+Inside the script:
 
-How to run (login node):
+- Demultiplexing / project paths:
+  - `DEMUX_ROOT="/hpc/dla_lti/yermanos_group/GRO11679/genetic_demultiplexing2"`
+  - `PROJ="${DEMUX_ROOT}"` (output root for this workflow)
+- Reference FASTA:
+  - `REF_FASTA="/hpc/.../REF_GEX/refdata-gex-GRCh38-2024-A/fasta/genome.fa"`
+- Cell Ranger multi root:
+  - `CR_RUN_ROOT="/hpc/.../GRO11679/alignment_CR/cellranger_multi_2025-12-01"`
+- Conda (Miniforge) + env with Souporcell:
+  - `MINIFORGE_ROOT="/hpc/.../software/venvs4/miniforge3"`
+  - `CONDA_ENV_PATH="/hpc/.../software/venvs4/souporcell"`
+- Captures and K values:
+  - `CAPTURE_IDS=(C1 C6)`     # captures to process
+  - `K_VALUES=(2  2)`         # same length and order as CAPTURE_IDS
+- Email notification (optional):
+  - `MAIL_USER="${MAIL_USER:-egrossewichtrup@umcutrecht.nl}"`  
+    (set empty to disable or override via env).
 
-    # Default: run for C1 with K=2
-    bash genetic_demultiplexing_script_1_GRO11679.sbatch
+### 3.2. What Script 1 does
 
-    # Example: run for C2 with K=3
-    CAPTURE_ID=C2 K=3 bash genetic_demultiplexing_script_1_GRO11679.sbatch
+For all captures in `CAPTURE_IDS`:
 
----
+- Creates project directories (if not present):
+  - `${PROJ}`, `${PROJ}/demux`, `${PROJ}/tmp`, `${PROJ}/logs`, `${PROJ}/sbatch`
+- Writes a timestamped Slurm **array script** to:
+  - `${PROJ}/sbatch/run_souporcell_array_<timestamp>.sbatch`
+- Submits an array job with one array task per capture.
+- For each array task (capture `C`):
+  - Finds the correct Cell Ranger multi directory for `C` under `CR_RUN_ROOT` using `find`.
+  - Derives:
+    - BAM:  
+      `${MULTI_DIR}/outs/per_sample_outs/<multi_basename>/count/sample_alignments.bam`
+    - Barcodes (gz):  
+      `${MULTI_DIR}/outs/per_sample_outs/<multi_basename>/count/sample_filtered_feature_bc_matrix/barcodes.tsv.gz`
+  - Creates:
+    - Output root: `${PROJ}/demux/C`
+    - Souporcell outdir: `${PROJ}/demux/C/C_souporcell`
+    - Job-local temp dir under `${PROJ}/tmp`.
+  - Activates the conda env (`CONDA_ENV_PATH`) and checks:
+    - `souporcell_pipeline.py`
+    - `samtools`
+  - Indexes FASTA and BAM if needed (`samtools faidx`, `samtools index`).
+  - Unzips barcodes to `${OUTDIR}/barcodes.tsv`.
+  - Runs Souporcell:
 
-### 2. `genetic_demultiplexing_script_2_patient_annotation_GRO11679.sbatch`
+    ```bash
+    souporcell_pipeline.py \
+      -i "${BAM}" \
+      -b "${BARCODES_TSV}" \
+      -f "${REF_FASTA}" \
+      -t "${SLURM_CPUS_PER_TASK}" \
+      -o "${OUTDIR}" \
+      -k "${K}"
+    ```
 
-SLURM job that:
+### 3.3. Inputs and outputs (Script 1)
 
-- Auto-detects the latest HashSolo output:
-  - `hashsolo_cells_full.csv` under `${DEMUX_ROOT}/hashsolo/...`
-  - Corresponding `captures.tsv` (HTO → sample mapping)
-- Auto-detects the latest Souporcell run for C1 under `${GENETIC_ROOT}`
-- Joins both sources:
-  - Uses HashSolo singlets and the HTO sample mapping to infer patient IDs per genetic cluster
-  - Matches HashSolo barcodes to Souporcell barcodes via the 10x barcode core
-- Writes per-capture outputs:
+**Inputs:**
+- 10x reference FASTA: `REF_FASTA`.
+- Cell Ranger multi outputs under `CR_RUN_ROOT` with:
+  - Per-capture subdirs named like `C1 *` and `multi_C1_*`.
+- Souporcell environment via `MINIFORGE_ROOT` and `CONDA_ENV_PATH`.
 
-    <SP_ROOT>/souporcell_with_patient_<timestamp>/<CAPTURE_ID>/
-        ├─ <CAPTURE_ID>_cluster_to_patient.tsv
-        └─ <CAPTURE_ID>_clusters_with_patient.tsv
+**Outputs (per capture `C`):**
+- Souporcell output directory:
+  - `${PROJ}/demux/C/C_souporcell/` (includes `clusters.tsv`).
+- Slurm logs:
+  - `${PROJ}/logs/souporcell_multi_<JOBID>_<TASKID>.out`
+  - `${PROJ}/logs/souporcell_multi_<JOBID>_<TASKID>.err`
 
-Where:
+### 3.4. How to start Script 1
 
-- `*_cluster_to_patient.tsv` maps Souporcell cluster IDs (`cluster_id`) to `patient_id_from_HTO`
-- `*_clusters_with_patient.tsv` is the original `clusters.tsv` plus a `patient_id_from_HTO` column per barcode
+On the login node:
 
-Important user-configurable variables at the top:
-
-- PROJ_MAIN, DEMUX_ROOT, GENETIC_ROOT  
-- HS_CSV and SP_ROOT (optional overrides; otherwise auto-detected)  
-- CAPTURES (currently `"C1"`)  
-- CONF_T (HashSolo singlet probability threshold, default `0.90`)  
-- R_BIN (Rscript binary, e.g. an R venv)  
-
-How to run:
-
-    sbatch genetic_demultiplexing_script_2_patient_annotation_GRO11679.sbatch
-
-After completion, check:
-
-    ls /hpc/dla_lti/yermanos_group/GRO11679/genetic_demultiplexing/demux/
-    # browse to: genetic_demultiplexing_<DATE>_.../souporcell_with_patient_<DATE>/C1/
-
----
-
-### 3. `plot_souporcell_barplot.sbatch`
-
-SLURM job that:
-
-- Reads the annotated clusters file:  
-  `<SP_ROOT>/<ANNOT_SUBDIR>/<CAPTURE>/_clusters_with_patient.tsv`
-- Filters to Souporcell singlets with a non-NA `patient_id_from_HTO`
-- Produces two barplots per capture:
-  - Absolute cell counts per Souporcell cluster, stacked by patient
-  - Fractions per cluster (relative composition), stacked by patient
-
-Output files (for `CAPTURE="C1"`):
-
-- `C1_souporcell_barplot_cells_per_cluster_by_patient.png`
-- `C1_souporcell_barplot_fraction_per_cluster_by_patient.png`
-
-Configurable variables:
-
-- CAPTURE (e.g. `"C1"`)  
-- SP_ROOT (Souporcell demux root)  
-- ANNOT_SUBDIR (e.g. `souporcell_with_patient_20251122_095429`)  
-- R_BIN (Rscript binary)  
-
-How to run:
-
-    sbatch plot_souporcell_barplot.sbatch
-
-Resulting PNGs are written next to the `*_clusters_with_patient.tsv` file for that capture.
-
----
-
-## Dependencies
-
-- SLURM
-- 10x Cell Ranger multi outputs with:
-  - BAM + `barcodes.tsv.gz` for each capture
-- Souporcell installed in the conda env specified by `CONDA_ENV_PATH`
-- `samtools` available in the same env
-- R with the packages:
-  - `readr`, `dplyr`, `stringr`, `purrr`, `ggplot2`
-
-Paths and environment variables in the scripts should be adapted to your own HPC and project layout before use.
+```bash
+bash genetic_demultiplexing_script_1_GRO11679.sbatch

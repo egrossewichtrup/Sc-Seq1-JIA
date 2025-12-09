@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=annotate_souporcell
-#SBATCH --time=04:00:00
+#SBATCH --job-name=annotate_and_plot_souporcell
+#SBATCH --time=05:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --chdir=/hpc/dla_lti/yermanos_group/GRO11679
-#SBATCH --output=/hpc/dla_lti/yermanos_group/GRO11679/logs/%x_%j.out
-#SBATCH --error=/hpc/dla_lti/yermanos_group/GRO11679/logs/%x_%j.err
+#SBATCH --output=/hpc/dla_lti/yermanos_group/GRO11679/genetic_demultiplexing/logs/%x_%j.out
+#SBATCH --error=/hpc/dla_lti/yermanos_group/GRO11679/genetic_demultiplexing/logs/%x_%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=egrossewichtrup@umcutrecht.nl
-
-
-#This script takes approx. 1 minute to run
 
 set -euo pipefail
 
@@ -25,21 +22,22 @@ PROJ_MAIN="/hpc/dla_lti/yermanos_group/GRO11679"
 DEMUX_ROOT="${PROJ_MAIN}/demultiplexing"
 GENETIC_ROOT="${PROJ_MAIN}/genetic_demultiplexing"
 
-# If you want to force a specific run, you can set these.
-# If they are left empty, the script auto-detects the newest.
-HS_CSV=""   # e.g. "/.../demultiplexing/hashsolo/20251114_132635_hashsolo_C1_C6_C8_C9_C10/hashsolo_cells_full.csv"
-SP_ROOT="/hpc/dla_lti/yermanos_group/GRO11679/genetic_demultiplexing/demux/genetic_demultiplexing_20251123_140314"  # e.g. "/.../genetic_demultiplexing/demux/genetic_demultiplexing_20251119_144453"
+# If you want to force a specific hashsolo CSV, set this.
+# If empty, it will auto-detect the newest hashsolo_cells_full.csv.
+HS_CSV="/hpc/dla_lti/yermanos_group/GRO11679/demultiplexing/hashsolo/20251202_145827_hashsolo_C1_C6_C8_C9_C10/hashsolo_cells_full.csv"
+
+# If you want to force a specific genetic demux run, set this.
+# If empty, it will auto-detect based on first capture in CAPTURES.
+SP_ROOT="/hpc/dla_lti/yermanos_group/GRO11679/genetic_demultiplexing/demux/C1"
 
 # Captures to process (Souporcell capture IDs)
-CAPTURES="C2"
+CAPTURES="C1"
 
 # If Souporcell and HashSolo/captures.tsv use different capture IDs,
 # define a mapping here: "souporcellID=hashsoloID souporcellID2=hashsoloID2"
-# Leave empty if not needed.
-# Example for your case: C2 in Souporcell = C6 in HashSolo/captures.tsv
-CAPTURE_REMAP="C2=C6"
+CAPTURE_REMAP=""
 
-# Confidence threshold for hashsolo singlets
+# Confidence threshold for HashSolo singlets
 CONF_T="0.90"
 
 # Rscript binary (same as in your HashSolo pipeline)
@@ -50,7 +48,21 @@ R_BIN="$VENV_ROOT/venvs4/r/bin/Rscript"
 #     END USER SETTINGS        #
 ################################
 
-log "Starting annotate_souporcell job (SLURM_JOB_ID=${SLURM_JOB_ID:-unknown})"
+log "Starting combined annotate + plot Souporcell job (SLURM_JOB_ID=${SLURM_JOB_ID:-unknown})"
+
+########################################
+# 0. TMPDIR and script dir             #
+########################################
+
+JOBTMP="${PROJ_MAIN}/genetic_demultiplexing/tmp/annotate_plot_souporcell_${SLURM_JOB_ID:-noid}_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$JOBTMP"
+export TMPDIR="$JOBTMP"
+export TMP="$JOBTMP"
+export TEMP="$JOBTMP"
+log "TMPDIR set to $JOBTMP"
+
+SCRIPT_DIR="${PROJ_MAIN}/genetic_demultiplexing/scripts"
+mkdir -p "$SCRIPT_DIR"
 
 ########################################
 # 1. Auto-detect HS_CSV and SP_ROOT   #
@@ -62,7 +74,6 @@ if [[ -z "$HS_CSV" ]]; then
 fi
 
 if [[ -z "$SP_ROOT" ]]; then
-  # use first capture in CAPTURES list
   FIRST_CAP="${CAPTURES%% *}"
   log "SP_ROOT not set – auto-detecting latest ${FIRST_CAP}_souporcell under ${GENETIC_ROOT}"
   CAP_DIR=$(find "${GENETIC_ROOT}" -maxdepth 6 -type d -name "${FIRST_CAP}_souporcell" 2>/dev/null | sort | tail -n1 || true)
@@ -112,15 +123,13 @@ ls -ld "$SP_ROOT"/"${FIRST_CAP}"_souporcell* || true
 # 3. Derive CAPTURE_CFG_TSV            #
 ########################################
 
-# HS_CSV path looks like:
-#   /.../demultiplexing/hashsolo/20251114_132635_hashsolo_C1_C6_C8_C9_C10/hashsolo_cells_full.csv
 HASH_DIR="$(dirname "$HS_CSV")"
-HASH_BASENAME="$(basename "$HASH_DIR")"  # 20251114_132635_hashsolo_C1_C6_C8_C9_C10
+HASH_BASENAME="$(basename "$HASH_DIR")"  # e.g. 20251114_132635_hashsolo_C1_C6_C8_C9_C10
 
-TS="${HASH_BASENAME%%_hashsolo_*}"       # 20251114_132635
-TAG="${HASH_BASENAME#*_hashsolo_}"       # C1_C6_C8_C9_C10
+TS_HS="${HASH_BASENAME%%_hashsolo_*}"    # e.g. 20251114_132635
+TAG="${HASH_BASENAME#*_hashsolo_}"       # e.g. C1_C6_C8_C9_C10
 
-CAPTURE_CFG_TSV="${DEMUX_ROOT}/demux/${TS}_demux_${TAG}/config/captures.tsv"
+CAPTURE_CFG_TSV="${DEMUX_ROOT}/demux/${TS_HS}_demux_${TAG}/config/captures.tsv"
 
 if [ ! -f "$CAPTURE_CFG_TSV" ]; then
   log "WARNING: Expected captures.tsv not found at:"
@@ -137,23 +146,13 @@ fi
 log "Using CAPTURE_CFG_TSV = $CAPTURE_CFG_TSV"
 
 ########################################
-# 4. TMPDIR and R script path          #
+# 4. Write annotate_souporcell R script#
 ########################################
 
-JOBTMP="${PROJ_MAIN}/tmp/annotate_souporcell_${SLURM_JOB_ID:-noid}_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$JOBTMP"
-export TMPDIR="$JOBTMP"
-export TMP="$JOBTMP"
-export TEMP="$JOBTMP"
-log "TMPDIR set to $JOBTMP"
+RSCRIPT_ANNOT="${SCRIPT_DIR}/annotate_souporcell_with_patient.R"
+log "Writing annotation R script to $RSCRIPT_ANNOT"
 
-SCRIPT_DIR="${PROJ_MAIN}/scripts"
-mkdir -p "$SCRIPT_DIR"
-RSCRIPT_FILE="${SCRIPT_DIR}/annotate_souporcell_with_patient.R"
-
-log "Writing R script to $RSCRIPT_FILE"
-
-cat > "$RSCRIPT_FILE" <<'RS'
+cat > "$RSCRIPT_ANNOT" <<'RS'
 #!/usr/bin/env Rscript
 
 suppressPackageStartupMessages({
@@ -244,8 +243,6 @@ if (length(missing_cols) > 0) {
 has_prob <- "singlet_hypothesis_probability" %in% names(hs)
 
 # derive 10x barcode core from cell_id
-# Example: "SeuratProject_..._multi_C1_AAACCAAAGCATTGCA-1"
-# -> take text after last "_" -> "AAACCAAAGCATTGCA-1" -> drop "-1"
 hs <- hs %>%
   mutate(
     barcode_full = cell_id,
@@ -276,7 +273,6 @@ annotate_capture <- function(cap_id) {
   if (!("barcode" %in% names(sp))) {
     stop("No 'barcode' column in clusters.tsv for ", cap_id)
   }
-  # Souporcell 4+ style: cluster ID is 'assignment'
   if (!("assignment" %in% names(sp))) {
     stop("No 'assignment' column in clusters.tsv for ", cap_id,
          " (expected Souporcell 'assignment' column)")
@@ -303,7 +299,7 @@ annotate_capture <- function(cap_id) {
 
   message("[INFO] Total HashSolo rows for ", hs_cap_id, ": ", nrow(hs_cap))
 
-  # define confident singlets from hashsolo
+  # define confident singlets from HashSolo
   hs_cap <- hs_cap %>%
     mutate(
       is_doublet  = Classification %in% c("Doublet","doublet"),
@@ -342,7 +338,7 @@ annotate_capture <- function(cap_id) {
             " in captures.tsv (Souporcell capture: ", cap_id, ")")
     return(NULL)
   }
-  hto_map <- map_short_list[[hs_cap_id]]  # named vector: HTO1 -> HC001 etc.
+  hto_map <- map_short_list[[hs_cap_id]]
 
   if (length(hto_map) == 0) {
     warning("Empty HTO map for capture ", hs_cap_id,
@@ -365,7 +361,6 @@ annotate_capture <- function(cap_id) {
     return(NULL)
   }
 
-  # keep only those with a mapped sample_short
   hs_cap_conf <- hs_cap_conf %>% filter(!is.na(sample_short))
 
   message("[INFO] Confident singlets with mapped sample_short for Souporcell ",
@@ -405,7 +400,6 @@ annotate_capture <- function(cap_id) {
   sp_annot <- sp %>%
     left_join(mapping, by = "cluster_id")
 
-  # Output directory still uses Souporcell capture ID (cap_id)
   out_dir <- file.path(OUT_ROOT, cap_id)
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -425,16 +419,19 @@ maps <- purrr::map(captures, annotate_capture)
 message("[DONE] Annotation finished.")
 RS
 
-chmod +x "$RSCRIPT_FILE"
+chmod +x "$RSCRIPT_ANNOT"
 
-# OUT_ROOT with timestamp to avoid overwriting
-TS="$(date +%Y%m%d_%H%M%S)"
-OUT_ROOT="${SP_ROOT}/souporcell_with_patient_${TS}"
+########################################
+# 5. Run annotation R script           #
+########################################
+
+TS_RUN="$(date +%Y%m%d_%H%M%S)"
+OUT_ROOT="${SP_ROOT}/souporcell_with_patient_${TS_RUN}"
 mkdir -p "$OUT_ROOT"
 
 export HS_CSV SP_ROOT OUT_ROOT CAPTURES CAPTURE_CFG_TSV CONF_T CAPTURE_REMAP
 
-log "Running R script with:"
+log "Running annotation R script with:"
 log "  HS_CSV          = $HS_CSV"
 log "  SP_ROOT         = $SP_ROOT"
 log "  OUT_ROOT        = $OUT_ROOT"
@@ -443,8 +440,128 @@ log "  CAPTURE_REMAP   = ${CAPTURE_REMAP:-<none>}"
 log "  CAPTURE_CFG_TSV = $CAPTURE_CFG_TSV"
 log "  CONF_T          = $CONF_T"
 
-"$R_BIN" "$RSCRIPT_FILE"
+"$R_BIN" "$RSCRIPT_ANNOT"
 
-log "R script finished successfully"
-log "Outputs are under: $OUT_ROOT"
+log "Annotation finished successfully"
+log "Annotated outputs are under: $OUT_ROOT"
+
+########################################
+# 6. Write plotting R script           #
+########################################
+
+RSCRIPT_PLOT="${SCRIPT_DIR}/plot_souporcell_barplot.R"
+log "Writing plotting R script to $RSCRIPT_PLOT"
+
+cat > "$RSCRIPT_PLOT" <<'RS'
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(ggplot2)
+})
+
+capture       <- Sys.getenv("CAPTURE", "C1")
+clusters_file <- Sys.getenv("CLUSTERS_FILE")
+capture_dir   <- dirname(clusters_file)
+
+message("[INFO] Capture:       ", capture)
+message("[INFO] Clusters file: ", clusters_file)
+
+if (clusters_file == "" || !file.exists(clusters_file)) {
+  stop("clusters_with_patient.tsv not found at: ", clusters_file)
+}
+
+df <- read_tsv(clusters_file, show_col_types = FALSE)
+
+needed <- c("barcode", "status", "assignment", "patient_id_from_HTO")
+missing <- setdiff(needed, names(df))
+if (length(missing) > 0) {
+  stop("Missing columns in ", clusters_file, ": ",
+       paste(missing, collapse = ", "))
+}
+
+df_filt <- df %>%
+  filter(
+    status == "singlet",
+    !is.na(patient_id_from_HTO)
+  )
+
+if (nrow(df_filt) == 0) {
+  stop("No singlet cells with patient_id_from_HTO found for capture ", capture)
+}
+
+message("[INFO] Cells used for plotting (singlets with patient ID): ",
+        nrow(df_filt))
+
+counts <- df_filt %>%
+  count(assignment, patient_id_from_HTO, name = "n_cells") %>%
+  group_by(assignment) %>%
+  mutate(n_total_cluster = sum(n_cells)) %>%
+  ungroup()
+
+counts <- counts %>%
+  mutate(
+    assignment = factor(assignment,
+                        levels = sort(unique(assignment)))
+  )
+
+# absolute counts
+p_cells <- ggplot(counts,
+                  aes(x = assignment,
+                      y = n_cells,
+                      fill = patient_id_from_HTO)) +
+  geom_col() +
+  labs(
+    title = paste0("Souporcell genetic clusters for capture ", capture),
+    x     = "Souporcell cluster (assignment)",
+    y     = "Number of cells (singlets)",
+    fill  = "Patient (HTO)"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+out_png_cells <- file.path(
+  capture_dir,
+  paste0(capture, "_souporcell_barplot_cells_per_cluster_by_patient.png")
+)
+
+ggsave(out_png_cells, p_cells, width = 7, height = 4.5, dpi = 300)
+message("[INFO] Saved absolute-count barplot to: ", out_png_cells)
+
+
+RS
+
+chmod +x "$RSCRIPT_PLOT"
+
+########################################
+# 7. Loop over captures and plot       #
+########################################
+
+log "Starting plotting for all captures: $CAPTURES"
+
+for CAPTURE in $CAPTURES; do
+  CAPTURE_DIR="${OUT_ROOT}/${CAPTURE}"
+  CLUSTERS_FILE="${CAPTURE_DIR}/${CAPTURE}_clusters_with_patient.tsv"
+
+  if [ ! -f "$CLUSTERS_FILE" ]; then
+    log "FATAL: clusters_with_patient file not found for ${CAPTURE}:"
+    log "       $CLUSTERS_FILE"
+    exit 1
+  fi
+
+  export CAPTURE CLUSTERS_FILE
+
+  log "Running plotting R script for capture ${CAPTURE} with:"
+  log "  CLUSTERS_FILE = $CLUSTERS_FILE"
+
+  "$R_BIN" "$RSCRIPT_PLOT"
+
+  log "Finished plotting for capture ${CAPTURE}"
+done
+
+log "All captures plotted successfully."
 log "Temporary directory was: $JOBTMP"
+

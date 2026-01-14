@@ -5,23 +5,59 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=96G
 #SBATCH --time=24:00:00
-#SBATCH --output=/hpc/dla_lti/yermanos_group/GRO11735/slurm/%x_%A_%a.out
-#SBATCH --error=/hpc/dla_lti/yermanos_group/GRO11735/slurm/%x_%A_%a.err
+#SBATCH --output=/hpc/dla_lti/yermanos_group/GRO11735/alignment_CR/%x_%A_%a.out
+#SBATCH --error=/hpc/dla_lti/yermanos_group/GRO11735/alignment_CR/%x_%A_%a.err
 
 set -euo pipefail
 set -x
 
+#####################################
+# === USER SETTINGS (edit here) === #
+#####################################
+
+# Cell Ranger binary
 CR="/hpc/dla_lti/yermanos_group/software/cellranger-9.0.1/bin/cellranger"
+
+# Project root
 ROOT="/hpc/dla_lti/yermanos_group/GRO11735"
+
+# Root for all alignment outputs (incl. logs, one subfolder per capture)
+ALIGN_ROOT="$ROOT/alignment_CR"
+
+# FASTQ root + pairs file
 FASTQ_ROOT="$ROOT/fastq"
 PAIRS="$FASTQ_ROOT/pairs.tsv"
 
-# Date+time stamped output root
-RUN_TS="$(date +%F_%H%M)"
-OUT_BASE="$ROOT/cellranger_${RUN_TS}"
-mkdir -p "$OUT_BASE/logs"
+# Capture IDs (order MUST match the lines in pairs.tsv)
+# Example for 5 captures:
+CAPTURES=(C4 C5 C2 C7 C3)
 
-# This array script expects you to submit with --array=1-N (N = lines in pairs.tsv)
+# Run array with: ``` sbatch --array=1-5 alignment_GRO11735.sbatch ````
+
+#####################################
+# === END USER SETTINGS ============
+#####################################
+
+# Make sure main dirs exist (Slurm log dir should exist before submit)
+mkdir -p "$ALIGN_ROOT" "$ALIGN_ROOT/slurm"
+
+# Check SLURM_ARRAY_TASK_ID
+if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
+  echo "ERROR: SLURM_ARRAY_TASK_ID is not set." >&2
+  exit 1
+fi
+
+# Map array index -> capture
+IDX=$((SLURM_ARRAY_TASK_ID - 1))
+if [ "$IDX" -lt 0 ] || [ "$IDX" -ge "${#CAPTURES[@]}" ]; then
+  echo "ERROR: No capture defined for SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID" >&2
+  echo "       CAPTURES has ${#CAPTURES[@]} entries (valid array IDs: 1..${#CAPTURES[@]})." >&2
+  exit 1
+fi
+CAPTURE="${CAPTURES[$IDX]}"
+echo "Using CAPTURE=$CAPTURE for SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID"
+
+# Read corresponding line from pairs.tsv (same ordering as CAPTURES)
 LINE="$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$PAIRS" || true)"
 echo "LINE='$LINE'"
 if [ -z "$LINE" ]; then
@@ -40,10 +76,15 @@ for L in 5 6 7 8; do
   ls "$FASTQ_ROOT/${VDJ_PREFIX}"_*_L00${L}_*.fastq.gz | head -n 1 >/dev/null
 done
 
+# Timestamped output root for this capture
+RUN_TS="$(date +%F_%H%M)"
+OUT_BASE="$ALIGN_ROOT/$CAPTURE/cellranger_${RUN_TS}"
+mkdir -p "$OUT_BASE/logs"
+
 # Unique per-sample ID (≤64 chars)
 HASH="$(printf '%s' "${GEX_PREFIX}_L5-8" | md5sum | awk '{print $1}' | cut -c1-10)"
 ID="GRO11735_${HASH}_L5-8"
-DESC="GEX=${GEX_PREFIX};VDJ=${VDJ_PREFIX};lanes=5,6,7,8"
+DESC="capture=${CAPTURE};GEX=${GEX_PREFIX};VDJ=${VDJ_PREFIX};lanes=5,6,7,8"
 
 # Clean any stale same-ID artifacts (inside this OUT_BASE only)
 rm -rf "$OUT_BASE/$ID" "$OUT_BASE/__${ID}.mro"
@@ -67,14 +108,16 @@ CSV
 # Sanity clean (no 'chain' column; enforce VDJ-B)
 sed -i '/^[[:space:]]*chain[[:space:]]*,/d' "$CSV"
 
-echo "=== CSV FINAL ==="; sed -n '1,200p' "$CSV"
+echo "=== CSV FINAL ==="
+sed -n '1,200p' "$CSV"
 
-# Run
+# Run Cell Ranger multi
 export TMPDIR="/scratch/${SLURM_JOB_ID}"
 cd "$OUT_BASE"
 echo OUT_BASE="$OUT_BASE"
 echo ID="$ID"
 echo CSV="$CSV"
+
 "$CR" --version
 "$CR" multi \
   --id="$ID" \

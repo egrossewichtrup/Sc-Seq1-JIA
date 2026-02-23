@@ -1,0 +1,72 @@
+# run this script on login node to validate results of 01_vdj_build_capture_then_split.sbatch
+
+
+
+
+#confirm all expected files are present
+root="/hpc/dla_lti/yermanos_group/Sc-Seq1-JIA/2026-02_AntibodyForest_Pipeline/02_results/vdj_build/by_sample"
+for s in HC001_B HC002_B P001_LK P001_RK P002_LK P002_RK P003_B HC003_B P004_LK P005_B P006_B P002_B P007_B P008_B P009_B P010_B; do
+  f="${root}/${s}/VDJ_build_${s}.rds.xz"
+  [[ -s "$f" ]] && echo "OK $s" || echo "MISSING $s"
+done
+
+
+#Spot check one file for expected columns and values
+source "/hpc/dla_lti/yermanos_group/software/venvs4/miniforge3/etc/profile.d/conda.sh"
+conda activate "/hpc/dla_lti/yermanos_group/software/venvs4/r"
+
+Rscript - <<'RS'
+f <- "/hpc/dla_lti/yermanos_group/Sc-Seq1-JIA/2026-02_AntibodyForest_Pipeline/02_results/vdj_build/by_sample/HC001_B/VDJ_build_HC001_B.rds.xz"
+vdj <- readRDS(f)
+cat("rows:", nrow(vdj), "cols:", ncol(vdj), "\n")
+need <- c("barcode","sample_id","patient_id","tissue","side","capture_id","clonotype_id","clonotype_id_10x_raw")
+cat("missing columns:", paste(setdiff(need, colnames(vdj)), collapse=", "), "\n")
+cat("capture_id unique:", paste(unique(vdj$capture_id), collapse=", "), "\n")
+cat("clonotype_id prefix example:", head(unique(vdj$clonotype_id), 3), "\n")
+RS
+
+
+
+
+#Check all files for expected columns and values, and check for barcode overlap within captures
+source "/hpc/dla_lti/yermanos_group/software/venvs4/miniforge3/etc/profile.d/conda.sh"
+conda activate "/hpc/dla_lti/yermanos_group/software/venvs4/r"
+
+Rscript - <<'RS'
+base <- "/hpc/dla_lti/yermanos_group/Sc-Seq1-JIA/2026-02_AntibodyForest_Pipeline/02_results/vdj_build/by_sample"
+
+samples <- c("HC001_B","HC002_B","P001_LK","P001_RK","P002_LK","P002_RK","P003_B","HC003_B","P004_LK","P005_B","P006_B","P002_B","P007_B","P008_B","P009_B","P010_B")
+
+norm <- function(x) sub("-1$", "", as.character(x))
+
+dat <- lapply(samples, function(s) {
+  f <- file.path(base, s, paste0("VDJ_build_", s, ".rds.xz"))
+  v <- readRDS(f)
+  data.frame(
+    sample_id = s,
+    capture_id = paste(unique(v$capture_id), collapse = ","),
+    n_rows = nrow(v),
+    n_barcodes = length(unique(norm(v$barcode))),
+    stringsAsFactors = FALSE
+  )
+})
+dat <- do.call(rbind, dat)
+print(dat[order(dat$capture_id, dat$sample_id), ], row.names = FALSE)
+
+cat("\nBarcode overlap within each capture\n")
+for (cid in sort(unique(dat$capture_id))) {
+  smp <- dat$sample_id[dat$capture_id == cid]
+  if (length(smp) < 2) next
+  bar <- lapply(smp, function(s) {
+    v <- readRDS(file.path(base, s, paste0("VDJ_build_", s, ".rds.xz")))
+    unique(norm(v$barcode))
+  })
+  names(bar) <- smp
+  for (i in 1:(length(smp)-1)) {
+    for (j in (i+1):length(smp)) {
+      inter <- length(intersect(bar[[i]], bar[[j]]))
+      cat(cid, smp[i], smp[j], "shared_barcodes", inter, "\n")
+    }
+  }
+}
+RS

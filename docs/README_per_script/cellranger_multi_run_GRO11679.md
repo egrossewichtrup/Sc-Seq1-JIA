@@ -38,7 +38,7 @@ QUICK START (COPY–PASTE)
    # Note: the script itself will also create "$PROJ/logs" and a dated run root.
 
 1) Create / verify the feature barcode CSV (WITH HEADER, HTO1–HTO4)
-   cat > "$PROJ/feature_ref/featurebarcode.csv" <<'CSV'
+cat > "/hpc/dla_lti/yermanos_group/GRO11679/alignment_CR/feature_ref/featurebarcode.csv" <<'CSV'
 id,name,read,pattern,sequence,feature_type
 HTO1,HTO1,R2,5PNNNNNNNNNN(BC),GTCAACTCTTTAGCG,Antibody Capture
 HTO2,HTO2,R2,5PNNNNNNNNNN(BC),TGATGGCCTATTGGG,Antibody Capture

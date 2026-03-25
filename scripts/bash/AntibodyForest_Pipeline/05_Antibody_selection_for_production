@@ -1,0 +1,718 @@
+setwd("/Users/egrossew/Library/CloudStorage/OneDrive-UMCUtrecht/03_Projects/2025_ScSeq1_JIA/04_Processed_Data/VDJ")
+
+###############################################################################
+# 0. Load data
+###############################################################################
+P001_LK_AF  <- readRDS(xzfile("P001_LK/AntibodyForests_P001_LK.rds.xz"))
+P001_LK_VDJ <- readRDS(xzfile("P001_LK/VDJ_build_P001_LK.rds.xz"))
+
+P001_RK_AF  <- readRDS(xzfile("P001_RK/AntibodyForests_P001_RK.rds.xz"))
+P001_RK_VDJ <- readRDS(xzfile("P001_RK/VDJ_build_P001_RK.rds.xz"))
+
+P002_B_AF   <- readRDS(xzfile("P002_B/AntibodyForests_P002_B.rds.xz"))
+P002_B_VDJ  <- readRDS(xzfile("P002_B/VDJ_build_P002_B.rds.xz"))
+
+P002_LK_AF  <- readRDS(xzfile("P002_LK/AntibodyForests_P002_LK.rds.xz"))
+P002_LK_VDJ <- readRDS(xzfile("P002_LK/VDJ_build_P002_LK.rds.xz"))
+
+P002_RK_AF  <- readRDS(xzfile("P002_RK/AntibodyForests_P002_RK.rds.xz"))
+P002_RK_VDJ <- readRDS(xzfile("P002_RK/VDJ_build_P002_RK.rds.xz"))
+
+P004_LK_AF  <- readRDS(xzfile("P004_LK/AntibodyForests_P004_LK.rds.xz"))
+P004_LK_VDJ <- readRDS(xzfile("P004_LK/VDJ_build_P004_LK.rds.xz"))
+
+
+view(P002_LK_VDJ)
+
+
+setwd("/Users/egrossew/Library/CloudStorage/OneDrive-UMCUtrecht/03_Projects/2025_ScSeq1_JIA/06_Results/VDJ/Antibody_Selection")
+
+###############################################################################
+# 1. Packages
+###############################################################################
+library(dplyr)
+library(tibble)
+library(purrr)
+
+###############################################################################
+# 2. Put objects into named lists
+###############################################################################
+af_list <- list(
+  P001_LK = P001_LK_AF,
+  P001_RK = P001_RK_AF,
+  P002_LK = P002_LK_AF,
+  P002_RK = P002_RK_AF,
+  P004_LK = P004_LK_AF
+)
+
+vdj_list <- list(
+  P001_LK = P001_LK_VDJ,
+  P001_RK = P001_RK_VDJ,
+  P002_LK = P002_LK_VDJ,
+  P002_RK = P002_RK_VDJ,
+  P004_LK = P004_LK_VDJ
+)
+
+###############################################################################
+# 3. Selected nodes
+###############################################################################
+
+# Selection of the sequences was based on:
+# - High number of cells per clonotype (expansion)
+# - For patient P001 and P002 sequences were selected, were the same paired HCDR3 and LCDR3 was found in both knees of a patient
+# - For patient P001 and P002 sequences were selected, were the same paired HCDR3 and LCDR3 was found in both knees of a patient
+# - For patient P004, only data from one knee was available
+
+
+# - Node position along the tree
+# - Presence of IgG or IgA
+# - Expansion (number of cells for a specific node)
+# - CDR3 (VDJ) overlap
+
+
+selected_nodes <- tribble(
+  ~Sample_id, ~clonotype_id, ~selected_node,
+  "P001_LK", "clonotype2",  1,
+  "P001_LK", "clonotype1",  1,
+  "P001_LK", "clonotype10", 1,
+  "P001_LK", "clonotype18", 1,
+  "P001_LK", "clonotype17", 1,
+  "P001_LK", "clonotype20", 1,
+  "P001_LK", "clonotype25", 1,
+  
+  "P001_RK", "clonotype1",  1,
+  "P001_RK", "clonotype2",  1,
+  "P001_RK", "clonotype11", 1,
+  "P001_RK", "clonotype19", 1,
+  "P001_RK", "clonotype14", 1,
+  "P001_RK", "clonotype28", 1,
+  "P001_RK", "clonotype27", 1,
+  
+  "P002_LK", "clonotype2",  1,
+  "P002_LK", "clonotype4",  1,
+  "P002_LK", "clonotype9",  1,
+  "P002_LK", "clonotype5",  1,
+  "P002_LK", "clonotype14", 1,
+  "P002_LK", "clonotype29", 1,
+  
+  "P002_RK", "clonotype1",  1,
+  "P002_RK", "clonotype2",  1,
+  "P002_RK", "clonotype3",  1,
+  "P002_RK", "clonotype8",  1,
+  "P002_RK", "clonotype34", 1,
+  "P002_RK", "clonotype35", 2,
+  
+  "P004_LK", "clonotype6",  4,
+  "P004_LK", "clonotype8",  2,
+  "P004_LK", "clonotype1",  1,
+  "P004_LK", "clonotype2",  1,
+  "P004_LK", "clonotype3",  1
+) %>%
+  mutate(selected_node = paste0("node", selected_node))
+
+###############################################################################
+# 4. Helper functions
+###############################################################################
+first_nonempty <- function(x) {
+  x <- as.character(x)
+  x <- x[!is.na(x) & trimws(x) != ""]
+  if (length(x) == 0) return(NA_character_)
+  x[[1]]
+}
+
+collapse_unique <- function(x) {
+  x <- as.character(x)
+  x <- x[!is.na(x) & trimws(x) != ""]
+  x <- sort(unique(x))
+  if (length(x) == 0) return(NA_character_)
+  paste(x, collapse = ";")
+}
+
+collapse_semicolon_sets <- function(x) {
+  x <- as.character(x)
+  x <- x[!is.na(x) & trimws(x) != ""]
+  if (length(x) == 0) return(NA_character_)
+  
+  parts <- unlist(strsplit(x, ";", fixed = TRUE))
+  parts <- trimws(parts)
+  parts <- parts[parts != ""]
+  parts <- sort(unique(parts))
+  
+  if (length(parts) == 0) return(NA_character_)
+  paste(parts, collapse = ";")
+}
+
+most_common_by_barcode <- function(df, value_col, barcode_col = "barcode") {
+  if (nrow(df) == 0) return(NA_character_)
+  
+  tmp <- tibble(
+    barcode = as.character(df[[barcode_col]]),
+    value = as.character(df[[value_col]])
+  ) %>%
+    filter(!is.na(value), trimws(value) != "") %>%
+    distinct(barcode, value) %>%
+    count(value, name = "n_barcodes", sort = TRUE)
+  
+  if (nrow(tmp) == 0) return(NA_character_)
+  
+  max_n <- max(tmp$n_barcodes, na.rm = TRUE)
+  
+  top_values <- tmp %>%
+    filter(n_barcodes == max_n) %>%
+    arrange(value) %>%
+    pull(value)
+  
+  paste(top_values, collapse = ";")
+}
+
+get_sample_root <- function(af_obj, sample_id) {
+  if (!is.null(af_obj[[sample_id]])) return(af_obj[[sample_id]])
+  af_obj[[1]]
+}
+
+find_af_key <- function(sample_root, clonotype_id) {
+  hits <- grep(paste0("\\.", clonotype_id, "$"), names(sample_root), value = TRUE)
+  
+  if (length(hits) != 1) {
+    stop(
+      "Could not find exactly one AF key for ", clonotype_id,
+      ". Found: ", paste(hits, collapse = ", ")
+    )
+  }
+  
+  hits[[1]]
+}
+
+###############################################################################
+# This helper picks one representative sequence bundle:
+# 1. choose the most prevalent paired NT sequence across unique barcodes
+# 2. from that exact NT pair, choose one barcode deterministically
+# 3. return the matching NT + AA + barcode together
+###############################################################################
+pick_top_sequence_bundle <- function(df,
+                                     barcode_col = "barcode",
+                                     heavy_nt_col = "VDJ_sequence_nt_trimmed",
+                                     light_nt_col = "VJ_sequence_nt_trimmed",
+                                     heavy_aa_col = "VDJ_sequence_aa_trimmed",
+                                     light_aa_col = "VJ_sequence_aa_trimmed") {
+  
+  out_na <- tibble(
+    selected_VDJ_sequence_nt_trimmed = NA_character_,
+    selected_VJ_sequence_nt_trimmed = NA_character_,
+    selected_VDJ_sequence_aa_trimmed = NA_character_,
+    selected_VJ_sequence_aa_trimmed = NA_character_,
+    barcode = NA_character_,
+    n_barcodes_supporting_selected_nt_pair = NA_integer_
+  )
+  
+  if (nrow(df) == 0) return(out_na)
+  
+  tmp <- tibble(
+    barcode = as.character(df[[barcode_col]]),
+    VDJ_sequence_nt_trimmed = as.character(df[[heavy_nt_col]]),
+    VJ_sequence_nt_trimmed = as.character(df[[light_nt_col]]),
+    VDJ_sequence_aa_trimmed = as.character(df[[heavy_aa_col]]),
+    VJ_sequence_aa_trimmed = as.character(df[[light_aa_col]])
+  ) %>%
+    filter(
+      !is.na(barcode), trimws(barcode) != "",
+      !is.na(VDJ_sequence_nt_trimmed), trimws(VDJ_sequence_nt_trimmed) != "",
+      !is.na(VJ_sequence_nt_trimmed), trimws(VJ_sequence_nt_trimmed) != "",
+      !is.na(VDJ_sequence_aa_trimmed), trimws(VDJ_sequence_aa_trimmed) != "",
+      !is.na(VJ_sequence_aa_trimmed), trimws(VJ_sequence_aa_trimmed) != ""
+    ) %>%
+    distinct(
+      barcode,
+      VDJ_sequence_nt_trimmed,
+      VJ_sequence_nt_trimmed,
+      VDJ_sequence_aa_trimmed,
+      VJ_sequence_aa_trimmed
+    )
+  
+  if (nrow(tmp) == 0) return(out_na)
+  
+  top_nt_pair <- tmp %>%
+    distinct(barcode, VDJ_sequence_nt_trimmed, VJ_sequence_nt_trimmed) %>%
+    count(
+      VDJ_sequence_nt_trimmed,
+      VJ_sequence_nt_trimmed,
+      name = "n_barcodes_supporting_selected_nt_pair",
+      sort = TRUE
+    ) %>%
+    arrange(
+      desc(n_barcodes_supporting_selected_nt_pair),
+      VDJ_sequence_nt_trimmed,
+      VJ_sequence_nt_trimmed
+    ) %>%
+    slice(1)
+  
+  representative_row <- tmp %>%
+    semi_join(
+      top_nt_pair,
+      by = c("VDJ_sequence_nt_trimmed", "VJ_sequence_nt_trimmed")
+    ) %>%
+    arrange(barcode, VDJ_sequence_aa_trimmed, VJ_sequence_aa_trimmed) %>%
+    slice(1)
+  
+  tibble(
+    selected_VDJ_sequence_nt_trimmed = representative_row$VDJ_sequence_nt_trimmed,
+    selected_VJ_sequence_nt_trimmed = representative_row$VJ_sequence_nt_trimmed,
+    selected_VDJ_sequence_aa_trimmed = representative_row$VDJ_sequence_aa_trimmed,
+    selected_VJ_sequence_aa_trimmed = representative_row$VJ_sequence_aa_trimmed,
+    barcode = representative_row$barcode,
+    n_barcodes_supporting_selected_nt_pair = top_nt_pair$n_barcodes_supporting_selected_nt_pair
+  )
+}
+
+###############################################################################
+# 5. Main extraction function
+###############################################################################
+extract_one_selected_node <- function(sample_id,
+                                      target_clonotype_id,
+                                      selected_node,
+                                      af_obj,
+                                      vdj_obj) {
+  
+  vdj_cols <- colnames(vdj_obj)
+  
+  sample_root <- get_sample_root(af_obj, sample_id)
+  af_key <- find_af_key(sample_root, target_clonotype_id)
+  clono_obj <- sample_root[[af_key]]
+  
+  if (!(selected_node %in% names(clono_obj$nodes))) {
+    stop(
+      "Node ", selected_node,
+      " not found in AF object for ", sample_id, " ", target_clonotype_id
+    )
+  }
+  
+  node <- clono_obj$nodes[[selected_node]]
+  
+  af_node_barcodes <- unique(as.character(node$barcodes))
+  af_node_size <- as.integer(node$size)[1]
+  
+  node_heavy_aa <- as.character(node$VDJ_sequence_aa_trimmed)[1]
+  node_light_aa <- as.character(node$VJ_sequence_aa_trimmed)[1]
+  
+  vdj_barcode_subset <- vdj_obj %>%
+    mutate(barcode = as.character(barcode)) %>%
+    filter(barcode %in% af_node_barcodes) %>%
+    add_count(barcode, name = "n_vdj_rows_for_this_barcode") %>%
+    mutate(
+      barcode_found_in_vdj = TRUE,
+      clonotype_match = as.character(clonotype_id) == target_clonotype_id,
+      heavy_aa_match = as.character(VDJ_sequence_aa_trimmed) == node_heavy_aa,
+      light_aa_match = as.character(VJ_sequence_aa_trimmed) == node_light_aa,
+      aa_pair_match = heavy_aa_match & light_aa_match
+    )
+  
+  matched_vdj <- vdj_barcode_subset %>%
+    filter(aa_pair_match)
+  
+  sequence_pick <- pick_top_sequence_bundle(matched_vdj)
+  
+  n_af_barcodes <- length(af_node_barcodes)
+  n_vdj_rows_with_af_barcodes <- nrow(vdj_barcode_subset)
+  n_vdj_unique_barcodes_with_af_barcodes <- dplyr::n_distinct(vdj_barcode_subset$barcode)
+  n_vdj_rows_matching_node_aa <- nrow(matched_vdj)
+  n_vdj_unique_barcodes_matching_node_aa <- dplyr::n_distinct(matched_vdj$barcode)
+  
+  af_vdj_barcode_count_match <- n_af_barcodes == n_vdj_unique_barcodes_matching_node_aa
+  af_size_matches_barcodes <- af_node_size == n_af_barcodes
+  af_size_matches_vdj_unique_barcodes <- af_node_size == n_vdj_unique_barcodes_matching_node_aa
+  
+  qc_found <- vdj_barcode_subset %>%
+    mutate(
+      Sample_id = sample_id,
+      target_clonotype_id = target_clonotype_id,
+      af_key = af_key,
+      selected_node = selected_node,
+      af_node_size = af_node_size,
+      n_af_barcodes = n_af_barcodes,
+      n_vdj_rows_with_af_barcodes = n_vdj_rows_with_af_barcodes,
+      n_vdj_unique_barcodes_with_af_barcodes = n_vdj_unique_barcodes_with_af_barcodes,
+      n_vdj_rows_matching_node_aa = n_vdj_rows_matching_node_aa,
+      n_vdj_unique_barcodes_matching_node_aa = n_vdj_unique_barcodes_matching_node_aa,
+      af_vdj_barcode_count_match = af_vdj_barcode_count_match,
+      af_size_matches_barcodes = af_size_matches_barcodes,
+      af_size_matches_vdj_unique_barcodes = af_size_matches_vdj_unique_barcodes,
+      selected_node_VDJ_sequence_aa_trimmed = node_heavy_aa,
+      selected_node_VJ_sequence_aa_trimmed = node_light_aa
+    ) %>%
+    select(
+      Sample_id,
+      target_clonotype_id,
+      af_key,
+      selected_node,
+      af_node_size,
+      n_af_barcodes,
+      n_vdj_rows_with_af_barcodes,
+      n_vdj_unique_barcodes_with_af_barcodes,
+      n_vdj_rows_matching_node_aa,
+      n_vdj_unique_barcodes_matching_node_aa,
+      barcode_found_in_vdj,
+      n_vdj_rows_for_this_barcode,
+      clonotype_match,
+      heavy_aa_match,
+      light_aa_match,
+      aa_pair_match,
+      all_of(vdj_cols),
+      af_vdj_barcode_count_match,
+      af_size_matches_barcodes,
+      af_size_matches_vdj_unique_barcodes,
+      selected_node_VDJ_sequence_aa_trimmed,
+      selected_node_VJ_sequence_aa_trimmed
+    )
+  
+  missing_barcodes <- setdiff(af_node_barcodes, vdj_barcode_subset$barcode)
+  
+  qc_missing_vdj <- as_tibble(vdj_obj[rep(NA_integer_, length(missing_barcodes)), , drop = FALSE])
+  
+  if (length(missing_barcodes) > 0) {
+    qc_missing_vdj$barcode <- missing_barcodes
+  }
+  
+  qc_missing <- qc_missing_vdj %>%
+    mutate(
+      Sample_id = sample_id,
+      target_clonotype_id = target_clonotype_id,
+      af_key = af_key,
+      selected_node = selected_node,
+      af_node_size = af_node_size,
+      n_af_barcodes = n_af_barcodes,
+      n_vdj_rows_with_af_barcodes = n_vdj_rows_with_af_barcodes,
+      n_vdj_unique_barcodes_with_af_barcodes = n_vdj_unique_barcodes_with_af_barcodes,
+      n_vdj_rows_matching_node_aa = n_vdj_rows_matching_node_aa,
+      n_vdj_unique_barcodes_matching_node_aa = n_vdj_unique_barcodes_matching_node_aa,
+      barcode_found_in_vdj = FALSE,
+      n_vdj_rows_for_this_barcode = 0L,
+      clonotype_match = NA,
+      heavy_aa_match = NA,
+      light_aa_match = NA,
+      aa_pair_match = NA,
+      af_vdj_barcode_count_match = af_vdj_barcode_count_match,
+      af_size_matches_barcodes = af_size_matches_barcodes,
+      af_size_matches_vdj_unique_barcodes = af_size_matches_vdj_unique_barcodes,
+      selected_node_VDJ_sequence_aa_trimmed = node_heavy_aa,
+      selected_node_VJ_sequence_aa_trimmed = node_light_aa
+    ) %>%
+    select(
+      Sample_id,
+      target_clonotype_id,
+      af_key,
+      selected_node,
+      af_node_size,
+      n_af_barcodes,
+      n_vdj_rows_with_af_barcodes,
+      n_vdj_unique_barcodes_with_af_barcodes,
+      n_vdj_rows_matching_node_aa,
+      n_vdj_unique_barcodes_matching_node_aa,
+      barcode_found_in_vdj,
+      n_vdj_rows_for_this_barcode,
+      clonotype_match,
+      heavy_aa_match,
+      light_aa_match,
+      aa_pair_match,
+      all_of(vdj_cols),
+      af_vdj_barcode_count_match,
+      af_size_matches_barcodes,
+      af_size_matches_vdj_unique_barcodes,
+      selected_node_VDJ_sequence_aa_trimmed,
+      selected_node_VJ_sequence_aa_trimmed
+    )
+  
+  qc_table <- bind_rows(qc_found, qc_missing) %>%
+    arrange(barcode)
+  
+  production_row <- tibble(
+    Sample_id = sample_id,
+    patient_id = first_nonempty(node$patient_id),
+    clonotype_id = target_clonotype_id,
+    selected_node = selected_node,
+    
+    af_node_size = af_node_size,
+    n_vdj_unique_barcodes_matching_node_aa = n_vdj_unique_barcodes_matching_node_aa,
+    
+    sequence_selection_rule = "node_pure_selected_AF_node_with_matching_VDJ_rows",
+    annotation_selection_rule = "mode_across_matching_barcodes_within_node_ties_joined_by_semicolon",
+    observed_isotypes_in_node = collapse_unique(node$isotype),
+    
+    VDJ_vgene = most_common_by_barcode(matched_vdj, "VDJ_vgene"),
+    VDJ_dgene = most_common_by_barcode(matched_vdj, "VDJ_dgene"),
+    VDJ_jgene = most_common_by_barcode(matched_vdj, "VDJ_jgene"),
+    VDJ_cgene = most_common_by_barcode(matched_vdj, "VDJ_cgene"),
+    
+    VJ_vgene = most_common_by_barcode(matched_vdj, "VJ_vgene"),
+    VJ_jgene = most_common_by_barcode(matched_vdj, "VJ_jgene"),
+    VJ_cgene = most_common_by_barcode(matched_vdj, "VJ_cgene"),
+    
+    VDJ_cdr3_nt = most_common_by_barcode(matched_vdj, "VDJ_cdr3_nt"),
+    VDJ_cdr3_aa = most_common_by_barcode(matched_vdj, "VDJ_cdr3_aa"),
+    VJ_cdr3_nt = most_common_by_barcode(matched_vdj, "VJ_cdr3_nt"),
+    VJ_cdr3_aa = most_common_by_barcode(matched_vdj, "VJ_cdr3_aa"),
+    
+    VDJ_sequence_nt_trimmed = sequence_pick$selected_VDJ_sequence_nt_trimmed,
+    VJ_sequence_nt_trimmed = sequence_pick$selected_VJ_sequence_nt_trimmed,
+    barcode = sequence_pick$barcode,
+    n_barcodes_supporting_selected_nt_pair = sequence_pick$n_barcodes_supporting_selected_nt_pair,
+    
+    VDJ_sequence_aa_trimmed = node_heavy_aa,
+    VJ_sequence_aa_trimmed = node_light_aa
+  )
+  
+  list(
+    production = production_row,
+    qc = qc_table
+  )
+}
+
+###############################################################################
+# 6. Run extraction for all selected nodes
+###############################################################################
+results <- pmap(
+  list(
+    selected_nodes$Sample_id,
+    selected_nodes$clonotype_id,
+    selected_nodes$selected_node
+  ),
+  function(Sample_id, clonotype_id, selected_node) {
+    extract_one_selected_node(
+      sample_id = Sample_id,
+      target_clonotype_id = clonotype_id,
+      selected_node = selected_node,
+      af_obj = af_list[[Sample_id]],
+      vdj_obj = vdj_list[[Sample_id]]
+    )
+  }
+)
+
+production_table <- bind_rows(lapply(results, `[[`, "production"))
+qc_table <- bind_rows(lapply(results, `[[`, "qc"))
+
+###############################################################################
+# 7. Determine one representative sequence bundle per collapsed CDR3 AA pair
+###############################################################################
+selected_sequence_summary <- qc_table %>%
+  filter(aa_pair_match %in% TRUE) %>%
+  mutate(
+    cdr3_pair_id = paste(VDJ_cdr3_aa, VJ_cdr3_aa, sep = "|||")
+  ) %>%
+  group_by(cdr3_pair_id) %>%
+  group_modify(~ pick_top_sequence_bundle(.x)) %>%
+  ungroup()
+
+###############################################################################
+# 8. Collapse across selected nodes by identical paired CDR3 AA sequence
+###############################################################################
+production_table_collapsed <- production_table %>%
+  mutate(
+    cdr3_pair_id = paste(VDJ_cdr3_aa, VJ_cdr3_aa, sep = "|||")
+  ) %>%
+  group_by(cdr3_pair_id) %>%
+  summarise(
+    n_collapsed_entries = n(),
+    
+    Sample_id = {
+      aligned <- tibble(
+        Sample_id = Sample_id,
+        clonotype_id = clonotype_id,
+        selected_node = selected_node
+      ) %>%
+        distinct()
+      paste(aligned$Sample_id, collapse = ";")
+    },
+    
+    patient_id = collapse_unique(patient_id),
+    
+    clonotype_id = {
+      aligned <- tibble(
+        Sample_id = Sample_id,
+        clonotype_id = clonotype_id,
+        selected_node = selected_node
+      ) %>%
+        distinct()
+      paste(aligned$clonotype_id, collapse = ";")
+    },
+    
+    selected_node = {
+      aligned <- tibble(
+        Sample_id = Sample_id,
+        clonotype_id = clonotype_id,
+        selected_node = selected_node
+      ) %>%
+        distinct()
+      paste(aligned$selected_node, collapse = ";")
+    },
+    
+    all_selected_nodes_with_same_cdr3_pair = {
+      aligned <- tibble(
+        Sample_id = Sample_id,
+        clonotype_id = clonotype_id,
+        selected_node = selected_node
+      ) %>%
+        distinct()
+      paste(
+        paste0(aligned$Sample_id, ":", aligned$clonotype_id, ":", aligned$selected_node),
+        collapse = ";"
+      )
+    },
+    
+    total_af_node_size = sum(af_node_size, na.rm = TRUE),
+    max_af_node_size = max(af_node_size, na.rm = TRUE),
+    total_n_vdj_unique_barcodes_matching_node_aa = sum(n_vdj_unique_barcodes_matching_node_aa, na.rm = TRUE),
+    max_n_vdj_unique_barcodes_matching_node_aa = max(n_vdj_unique_barcodes_matching_node_aa, na.rm = TRUE),
+    
+    sequence_selection_rule = collapse_unique(sequence_selection_rule),
+    annotation_selection_rule = collapse_unique(annotation_selection_rule),
+    observed_isotypes_in_node = collapse_semicolon_sets(observed_isotypes_in_node),
+    
+    VDJ_vgene = collapse_semicolon_sets(VDJ_vgene),
+    VDJ_dgene = collapse_semicolon_sets(VDJ_dgene),
+    VDJ_jgene = collapse_semicolon_sets(VDJ_jgene),
+    VDJ_cgene = collapse_semicolon_sets(VDJ_cgene),
+    
+    VJ_vgene = collapse_semicolon_sets(VJ_vgene),
+    VJ_jgene = collapse_semicolon_sets(VJ_jgene),
+    VJ_cgene = collapse_semicolon_sets(VJ_cgene),
+    
+    VDJ_cdr3_nt = collapse_semicolon_sets(VDJ_cdr3_nt),
+    VDJ_cdr3_aa = collapse_semicolon_sets(VDJ_cdr3_aa),
+    VJ_cdr3_nt = collapse_semicolon_sets(VJ_cdr3_nt),
+    VJ_cdr3_aa = collapse_semicolon_sets(VJ_cdr3_aa),
+    
+    VDJ_sequence_aa_trimmed = collapse_semicolon_sets(VDJ_sequence_aa_trimmed),
+    VJ_sequence_aa_trimmed = collapse_semicolon_sets(VJ_sequence_aa_trimmed),
+    
+    .groups = "drop"
+  ) %>%
+  left_join(selected_sequence_summary, by = "cdr3_pair_id")
+
+###############################################################################
+# 9. Detailed production table
+###############################################################################
+production_table_detailed <- production_table_collapsed %>%
+  select(
+    Sample_id,
+    patient_id,
+    clonotype_id,
+    selected_node,
+    all_selected_nodes_with_same_cdr3_pair,
+    n_collapsed_entries,
+    total_af_node_size,
+    max_af_node_size,
+    total_n_vdj_unique_barcodes_matching_node_aa,
+    max_n_vdj_unique_barcodes_matching_node_aa,
+    sequence_selection_rule,
+    annotation_selection_rule,
+    observed_isotypes_in_node,
+    barcode,
+    n_barcodes_supporting_selected_nt_pair,
+    VDJ_vgene,
+    VDJ_dgene,
+    VDJ_jgene,
+    VDJ_cgene,
+    VJ_vgene,
+    VJ_jgene,
+    VJ_cgene,
+    VDJ_cdr3_nt,
+    VDJ_cdr3_aa,
+    VJ_cdr3_nt,
+    VJ_cdr3_aa,
+    selected_VDJ_sequence_nt_trimmed,
+    selected_VJ_sequence_nt_trimmed,
+    selected_VDJ_sequence_aa_trimmed,
+    selected_VJ_sequence_aa_trimmed,
+    VDJ_sequence_aa_trimmed,
+    VJ_sequence_aa_trimmed
+  )
+
+###############################################################################
+# 10. Final production table
+###############################################################################
+production_table_final <- production_table_collapsed %>%
+  transmute(
+    Sample_id,
+    patient_id,
+    clonotype_id,
+    selected_node,
+    total_cells = total_af_node_size,
+    total_matching_barcodes = total_n_vdj_unique_barcodes_matching_node_aa,
+    example_barcode = barcode,
+    most_prevalent_VDJ_vgene = VDJ_vgene,
+    most_prevalent_VDJ_dgene = VDJ_dgene,
+    most_prevalent_VDJ_jgene = VDJ_jgene,
+    most_prevalent_VDJ_cgene = VDJ_cgene,
+    most_prevalent_VJ_vgene = VJ_vgene,
+    most_prevalent_VJ_jgene = VJ_jgene,
+    most_prevalent_VJ_cgene = VJ_cgene,
+    most_prevalent_VDJ_cdr3_aa = VDJ_cdr3_aa,
+    most_prevalent_VJ_cdr3_aa = VJ_cdr3_aa,
+    VDJ_sequence_nt_trimmed = selected_VDJ_sequence_nt_trimmed,
+    VJ_sequence_nt_trimmed = selected_VJ_sequence_nt_trimmed,
+    VDJ_sequence_aa_trimmed = selected_VDJ_sequence_aa_trimmed,
+    VJ_sequence_aa_trimmed = selected_VJ_sequence_aa_trimmed,
+    observed_isotypes_in_node
+  )
+
+###############################################################################
+# 11. QC summary
+###############################################################################
+qc_summary <- qc_table %>%
+  group_by(Sample_id, target_clonotype_id, selected_node, af_key) %>%
+  summarise(
+    af_node_size = first(af_node_size),
+    n_af_barcodes = first(n_af_barcodes),
+    n_vdj_rows_with_af_barcodes = first(n_vdj_rows_with_af_barcodes),
+    n_vdj_unique_barcodes_with_af_barcodes = first(n_vdj_unique_barcodes_with_af_barcodes),
+    n_vdj_rows_matching_node_aa = first(n_vdj_rows_matching_node_aa),
+    n_unique_barcodes_matching_node_aa = first(n_vdj_unique_barcodes_matching_node_aa),
+    n_barcodes_found_in_vdj = sum(barcode_found_in_vdj, na.rm = TRUE),
+    af_vdj_barcode_count_match = first(af_vdj_barcode_count_match),
+    af_size_matches_barcodes = first(af_size_matches_barcodes),
+    af_size_matches_vdj_unique_barcodes = first(af_size_matches_vdj_unique_barcodes),
+    selected_node_VDJ_sequence_aa_trimmed = first(selected_node_VDJ_sequence_aa_trimmed),
+    selected_node_VJ_sequence_aa_trimmed = first(selected_node_VJ_sequence_aa_trimmed),
+    .groups = "drop"
+  )
+
+###############################################################################
+# 12. Save outputs
+###############################################################################
+write.csv(
+  production_table_detailed,
+  "selected_AB_production_table_detailed_collapsed_CDR3_AA_mode_annotations.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  production_table_final,
+  "selected_AB_production_table_final_collapsed_CDR3_AA.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  qc_table,
+  "selected_AB_qc_table_node_pure.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  qc_summary,
+  "selected_AB_qc_summary_node_pure.csv",
+  row.names = FALSE
+)
+
+###############################################################################
+# 13. Inspect
+###############################################################################
+print(production_table_final)
+View(production_table_final)
+
+print(production_table_detailed)
+View(production_table_detailed)
+
+print(qc_summary)
+View(qc_summary)
+
+
+

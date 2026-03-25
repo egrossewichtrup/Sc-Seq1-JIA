@@ -28,8 +28,8 @@ ONLY_SAMPLE="${ONLY_SAMPLE:-}"          # example: ONLY_SAMPLE="P001_LK"
 ###############################################################################
 # Step 1 options
 ###############################################################################
-FORCE_REBUILD="${FORCE_REBUILD:-0}"     # set to 1 to overwrite existing outputs
-KEEP_SINGLETONS="${KEEP_SINGLETONS:-0}" # set to 1 to keep clonotypes with 1 unique node
+FORCE_REBUILD="${FORCE_REBUILD:-1}"     # set to 1 to overwrite existing outputs
+KEEP_SINGLETONS="${KEEP_SINGLETONS:-1}" # set to 1 to keep clonotypes with 1 unique node
 
 ###############################################################################
 # Step 2 options
@@ -86,7 +86,7 @@ project_root <- Sys.getenv("PROJECT_ROOT")
 input_root   <- Sys.getenv("INPUT_BY_SAMPLE")
 only_sample  <- Sys.getenv("ONLY_SAMPLE")
 force_rebuild <- as.integer(Sys.getenv("FORCE_REBUILD", "0"))
-keep_singletons <- as.integer(Sys.getenv("KEEP_SINGLETONS", "0"))
+keep_singletons <- as.integer(Sys.getenv("KEEP_SINGLETONS", "1"))
 cpus         <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "1"))
 if (is.na(cpus) || cpus < 1) cpus <- 1
 
@@ -429,6 +429,10 @@ edge_label <- Sys.getenv("EDGE_LABEL", "none")
 node_size <- Sys.getenv("NODE_SIZE", "expansion")
 show_inner_nodes <- tolower(Sys.getenv("SHOW_INNER_NODES", "FALSE")) %in% c("true","t","1","yes","y")
 
+# Second PDF node labels: node identifier (igraph vertex name)
+# If you want sample labels instead, change "name" to "sample_id" here.
+label_by_nodeid <- "name"
+
 af_root   <- file.path(project_root, "02_results", "af_objects", "by_sample")
 plot_root <- file.path(project_root, "02_results", "plots", "by_sample")
 qc_root   <- file.path(project_root, "02_results", "qc")
@@ -521,6 +525,7 @@ plot_igraph_fallback <- function(g, color_by, label_by, edge_label, node_size, m
   if (label_by == "name" && "name" %in% vattrs) lab <- as.character(V(g)$name)
   if (label_by == "size" && "size" %in% vattrs) lab <- as.character(V(g)$size)
   if (label_by == "size" && !("size" %in% vattrs) && "expansion" %in% vattrs) lab <- as.character(V(g)$expansion)
+  if (label_by == "sample_id" && "sample_id" %in% vattrs) lab <- as.character(V(g)$sample_id)
 
   vsz <- rep(12, vcount(g))
   if (node_size == "expansion") {
@@ -567,7 +572,11 @@ for (i in seq_along(sids)) {
   rank_tsv <- file.path(out_dir, paste0("clonotype_ranking_", sid, ".tsv"))
   pdf_out <- file.path(out_dir, paste0("trees_top", n_clones, "_minNodes", min_nodes, "_color", color_by, "_label", label_by, ".pdf"))
 
+  # Second PDF with node identifiers
+  pdf_out_nodeid <- file.path(out_dir, paste0("trees_top", n_clones, "_minNodes", min_nodes, "_color", color_by, "_labelnodeid.pdf"))
+
   if (file.exists(pdf_out)) file.remove(pdf_out)
+  if (file.exists(pdf_out_nodeid)) file.remove(pdf_out_nodeid)
 
   t0 <- Sys.time()
 
@@ -578,6 +587,7 @@ for (i in seq_along(sids)) {
   cat("Sample folder: ", sid, "\n", sep = "")
   cat("Input AF RDS: ", in_rds, "\n", sep = "")
   cat("Output PDF:  ", pdf_out, "\n", sep = "")
+  cat("Output PDF (node ids):  ", pdf_out_nodeid, "\n", sep = "")
   cat("Settings: n_clones=", n_clones,
       " min_nodes=", min_nodes,
       " color_by=", color_by,
@@ -640,6 +650,7 @@ for (i in seq_along(sids)) {
     } else {
       top <- info[seq_len(min(nrow(info), n_clones)), , drop = FALSE]
 
+      # PDF 1: unchanged behavior
       pdf(pdf_out, width = 10, height = 8, onefile = TRUE, useDingbats = FALSE)
       on.exit(dev.off(), add = TRUE)
 
@@ -709,6 +720,72 @@ for (i in seq_along(sids)) {
         }
       }
 
+      # PDF 2: node identifiers
+      pdf(pdf_out_nodeid, width = 10, height = 8, onefile = TRUE, useDingbats = FALSE)
+      on.exit(dev.off(), add = TRUE)
+
+      for (j in seq_len(nrow(top))) {
+        k <- top$key[[j]]
+        s_parsed <- top$parsed_sample[[j]]
+        c_parsed <- top$parsed_clonotype[[j]]
+
+        g <- rec[[match(k, keys)]]$graph
+
+        main_title <- paste0("Lineage tree, folder ", sid)
+        sub_title <- paste0("key=", k, " nodes=", top$n_nodes[[j]])
+
+        cat("Plotting node-id PDF: key=", k, " parsed_sample=", s_parsed, " parsed_clonotype=", c_parsed, "\n", sep = "")
+
+        sample_candidates <- unique(c(s_parsed, sid))
+        clonotype_candidates <- unique(c(c_parsed, k, paste0(s_parsed, ".", c_parsed), paste0(s_parsed, "__", c_parsed)))
+
+        plotted_this <- FALSE
+        last_err <- NA_character_
+
+        for (s_try in sample_candidates) {
+          for (c_try in clonotype_candidates) {
+            for (obj_try in list(af_list, af)) {
+              tryCatch({
+                call_Af_plot_tree(
+                  obj = obj_try,
+                  sample_name = s_try,
+                  clonotype_name = c_try,
+                  color_by = color_by,
+                  label_by = label_by_nodeid,
+                  edge_label = edge_label,
+                  node_size = node_size,
+                  show_inner_nodes = show_inner_nodes,
+                  main_title = main_title,
+                  sub_title = paste0("Af_plot_tree node-id: sample=", s_try, " clonotype=", c_try)
+                )
+                plotted_this <- TRUE
+                cat("SUCCESS Af_plot_tree node-id with sample=", s_try, " clonotype=", c_try, "\n", sep = "")
+                break
+              }, error = function(e2) {
+                last_err <<- conditionMessage(e2)
+              })
+              if (plotted_this) break
+            }
+            if (plotted_this) break
+          }
+          if (plotted_this) break
+        }
+
+        if (!plotted_this) {
+          cat("Af_plot_tree node-id failed for key ", k, ". Last error: ", last_err, "\n", sep = "")
+          cat("Falling back to direct igraph plotting (node-id) for key ", k, "\n", sep = "")
+          plot_igraph_fallback(
+            g = g,
+            color_by = color_by,
+            label_by = label_by_nodeid,
+            edge_label = edge_label,
+            node_size = node_size,
+            main_title = main_title,
+            sub_title = paste0("Fallback igraph plot node-id: ", sub_title)
+          )
+        }
+      }
+
       if (n_plotted > 0) {
         status <- "ok"
         err_msg <- NA_character_
@@ -729,6 +806,7 @@ for (i in seq_along(sids)) {
 
   secs <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
   pdf_size <- if (file.exists(pdf_out)) file.info(pdf_out)$size else 0
+  pdf_size_nodeid <- if (file.exists(pdf_out_nodeid)) file.info(pdf_out_nodeid)$size else 0
 
   sink(type = "message")
   sink(type = "output")
@@ -751,6 +829,7 @@ for (i in seq_along(sids)) {
     node_size = node_size,
     show_inner_nodes = show_inner_nodes,
     pdf_bytes = as.numeric(pdf_size),
+    pdf_bytes_nodeid = as.numeric(pdf_size_nodeid),
     seconds = secs,
     error = err_msg,
     stringsAsFactors = FALSE
@@ -764,4 +843,61 @@ write.table(qc_df, qc_path, sep = "\t", quote = FALSE, row.names = FALSE)
 cat("Wrote plot QC summary: ", qc_path, "\n", sep = "")
 RSCRIPT
 
+###############################################################################
+# Step 3: Merge per-sample PDFs into 2 combined PDFs (no R dependencies)
+###############################################################################
+plot_root="${project_root}/02_results/plots/by_sample"
+
+# Try to make a merge tool available via modules (harmless if "module" not present)
+if command -v module >/dev/null 2>&1; then
+  module --silent avail qpdf ghostscript poppler >/dev/null 2>&1 || true
+  module --silent load qpdf 2>/dev/null || true
+  module --silent load ghostscript 2>/dev/null || true
+  module --silent load poppler 2>/dev/null || true   # provides pdfunite sometimes
+fi
+
+merge_one_type () {
+  local pattern="$1"
+  local outpdf="$2"
+
+  cd "$plot_root"
+
+  mapfile -d '' files < <(find . -type f -name "$pattern" -print0 | sort -z)
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    echo "No files found for pattern: $pattern"
+    return 0
+  fi
+
+  echo "Merging ${#files[@]} PDFs into: ${plot_root}/${outpdf}"
+
+  if command -v pdfunite >/dev/null 2>&1; then
+    pdfunite "${files[@]}" "${outpdf}"
+    return $?
+  fi
+
+  if command -v qpdf >/dev/null 2>&1; then
+    qpdf --empty --pages "${files[@]}" -- "${outpdf}"
+    return $?
+  fi
+
+  if command -v gs >/dev/null 2>&1; then
+    gs -dBATCH -dNOPAUSE -q -sDEVICE=pdfwrite -sOutputFile="${outpdf}" "${files[@]}"
+    return $?
+  fi
+
+  echo "ERROR: No PDF merge tool found (pdfunite, qpdf, gs)."
+  echo "Hint: check modules: module avail qpdf ghostscript poppler"
+  return 1
+}
+
+# Merge node-id PDFs
+MERGE_PATTERN="trees_top${N_CLONES}_minNodes${MIN_NODES}_color${COLOR_BY}_labelnodeid.pdf"
+merge_one_type "${MERGE_PATTERN}" "merged_${MERGE_PATTERN}"
+
+# Merge size PDFs (your main output)
+MERGE_PATTERN="trees_top${N_CLONES}_minNodes${MIN_NODES}_color${COLOR_BY}_label${LABEL_BY}.pdf"
+merge_one_type "${MERGE_PATTERN}" "merged_${MERGE_PATTERN}"
+
 echo "Finished"
+

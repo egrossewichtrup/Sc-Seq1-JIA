@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=AF_metrics_and_sequences_v1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=16:00:00
+#SBATCH --output=/hpc/dla_lti/yermanos_group/Sc-Seq1-JIA/2026-02_AF_pipeline_wo_reclonotyping/01_logs/slurm/%x_%j.out
+#SBATCH --error=/hpc/dla_lti/yermanos_group/Sc-Seq1-JIA/2026-02_AF_pipeline_wo_reclonotyping/01_logs/slurm/%x_%j.err
+
+set -euo pipefail
+
+###############################################################################
+# Fixed project root
+###############################################################################
+project_root="/hpc/dla_lti/yermanos_group/Sc-Seq1-JIA/2026-02_AF_pipeline_wo_reclonotyping"
+af_root="${project_root}/02_results/af_objects/by_sample"
+
+# Conda and R
+conda_sh="/hpc/dla_lti/yermanos_group/software/venvs4/miniforge3/etc/profile.d/conda.sh"
+r_env="/hpc/dla_lti/yermanos_group/software/venvs4/r"
+
+###############################################################################
+# Optional selectors
+###############################################################################
+ONLY_SAMPLE="${ONLY_SAMPLE:-}"                  # example: ONLY_SAMPLE="P001_LK"
+
+###############################################################################
+# Step options
+###############################################################################
+METRICS_MIN_NODES="${METRICS_MIN_NODES:-1}"     # for Af_metrics, includes germline
+SEQ_MIN_NODES="${SEQ_MIN_NODES:-3}"             # for Af_get_sequences, excludes germline
+SEQ_MIN_EDGES="${SEQ_MIN_EDGES:-1}"             # for Af_get_sequences, excludes germline edges
+TOP_TREES_PER_SAMPLE="${TOP_TREES_PER_SAMPLE:-20}"
+LABEL_TOP_N="${LABEL_TOP_N:-12}"
+
+###############################################################################
+# Directories
+###############################################################################
+mkdir -p "${project_root}/00_config"
+mkdir -p "${project_root}/01_logs/slurm"
+mkdir -p "${project_root}/02_results/metrics/by_sample"
+mkdir -p "${project_root}/02_results/metrics/combined"
+mkdir -p "${project_root}/02_results/sequences/by_sample"
+mkdir -p "${project_root}/02_results/qc"
+
+cd "${project_root}"
+
+###############################################################################
+# Temp dir
+###############################################################################
+export TMPDIR="${SLURM_TMPDIR:-/tmp/${USER}/AF_metrics_${SLURM_JOB_ID:-manual}}"
+mkdir -p "${TMPDIR}"
+
+###############################################################################
+# Activate environment
+###############################################################################
+source "${conda_sh}"
+conda activate "${r_env}"
+
+###############################################################################
+# Export variables for R
+###############################################################################
+export PROJECT_ROOT="${project_root}"
+export AF_ROOT="${af_root}"
+export ONLY_SAMPLE
+export METRICS_MIN_NODES
+export SEQ_MIN_NODES
+export SEQ_MIN_EDGES
+export TOP_TREES_PER_SAMPLE
+export LABEL_TOP_N
+export SLURM_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"
+
+###############################################################################
+# Run R
+###############################################################################
+Rscript --vanilla - <<'RSCRIPT'
+suppressPackageStartupMessages({
+  library(AntibodyForests)
+  library(ggplot2)
+})
+
+options(stringsAsFactors = FALSE)
+
+project_root <- Sys.getenv("PROJECT_ROOT")
+af_root <- Sys.getenv("AF_ROOT")
+only_sample <- Sys.getenv("ONLY_SAMPLE")
+metrics_min_nodes <- as.integer(Sys.getenv("METRICS_MIN_NODES", "1"))
+seq_min_nodes <- as.integer(Sys.getenv("SEQ_MIN_NODES", "3"))
+seq_min_edges <- as.integer(Sys.getenv("SEQ_MIN_EDGES", "1"))
+top_trees_per_sample <- as.integer(Sys.getenv("TOP_TREES_PER_SAMPLE", "20"))
+label_top_n <- as.integer(Sys.getenv("LABEL_TOP_N", "12"))
+cpus <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "1"))
+if (is.na(cpus) || cpus < 1) cpus <- 1
+
+metrics_by_sample_dir <- file.path(project_root, "02_results", "metrics", "by_sample")
+metrics_combined_dir  <- file.path(project_root, "02_results", "metrics", "combined")
+seq_by_sample_dir     <- file.path(project_root, "02_results", "sequences", "by_sample")
+qc_dir                <- file.path(project_root, "02_results", "qc")
+
+dir.create(metrics_by_sample_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(metrics_combined_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(seq_by_sample_dir,     recursive = TRUE, showWarnings = FALSE)
+dir.create(qc_dir,                recursive = TRUE, showWarnings = FALSE)
+
+if (!dir.exists(af_root)) stop("AF object directory not found: ", af_root)
+
+af_files <- list.files(
+  path = af_root,
+  pattern = "^AntibodyForests_.*\\.rds\\.xz$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+if (length(af_files) < 1) stop("No AntibodyForests_*.rds.xz files found under: ", af_root)
+
+get_sample_id <- function(p) basename(dirname(p))
+
+sample_ids <- vapply(af_files, get_sample_id, character(1))
+o <- order(sample_ids)
+af_files <- af_files[o]
+sample_ids <- sample_ids[o]
+
+if (nzchar(only_sample)) {
+  keep <- sample_ids == only_sample
+  if (!any(keep)) stop("ONLY_SAMPLE was set but not found: ", only_sample)
+  af_files <- af_files[keep]
+  sample_ids <- sample_ids[keep]
+}
+
+manifest_path <- file.path(project_root, "00_config", "samples_for_af_metrics.tsv")
+write.table(
+  data.frame(sample_id = sample_ids, af_rds = af_files),
+  manifest_path,
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+split_key <- function(key) {
+  key <- as.character(key)
+
+  m1 <- regexec("^(.+)\\.(clonotype[^.]+)$", key)
+  r1 <- regmatches(key, m1)[[1]]
+  if (length(r1) == 3) {
+    return(list(sample = r1[2], clonotype = r1[3], key = key))
+  }
+
+  m2 <- regexec("^(.+)__(clonotype[^.]+)$", key)
+  r2 <- regmatches(key, m2)[[1]]
+  if (length(r2) == 3) {
+    return(list(sample = r2[2], clonotype = r2[3], key = key))
+  }
+
+  list(sample = NA_character_, clonotype = NA_character_, key = key)
+}
+
+safe_write_tsv <- function(df, path) {
+  write.table(df, file = path, sep = "\t", quote = FALSE, row.names = FALSE)
+}
+
+safe_metric_call <- function(af_obj, metrics_min_nodes, cpus) {
+  fml <- names(formals(AntibodyForests::Af_metrics))
+  args <- list(
+    input = af_obj,
+    min.nodes = metrics_min_nodes,
+    metrics = c("nr.nodes", "nr.cells"),
+    output.format = "dataframe"
+  )
+  if ("node.feature" %in% fml) args$node.feature <- NA
+  if ("group.node.feature" %in% fml) args$group.node.feature <- NA
+  if ("multiple.objects" %in% fml) args$multiple.objects <- FALSE
+  if ("parallel" %in% fml) args$parallel <- cpus > 1
+  if ("num.cores" %in% fml) args$num.cores <- cpus
+
+  do.call(AntibodyForests::Af_metrics, args)
+}
+
+safe_export_sequences <- function(af_obj, sid, seq_by_sample_dir, seq_min_nodes, seq_min_edges) {
+  candidate_sequence_names <- c(
+    "VDJ_sequence_aa_trimmed",
+    "VJ_sequence_aa_trimmed",
+    "VDJ_sequence_nt_trimmed",
+    "VJ_sequence_nt_trimmed"
+  )
+
+  export_log <- data.frame(
+    sample_id = character(0),
+    sequence_name = character(0),
+    output_tsv = character(0),
+    n_rows = integer(0),
+    status = character(0),
+    error = character(0),
+    stringsAsFactors = FALSE
+  )
+
+  sample_out_dir <- file.path(seq_by_sample_dir, sid)
+  dir.create(sample_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  for (seq_name in candidate_sequence_names) {
+    out_tsv <- file.path(sample_out_dir, paste0("Af_sequences_", sid, "_", seq_name, ".tsv"))
+
+    res <- tryCatch({
+      seq_df <- AntibodyForests::Af_get_sequences(
+        AntibodyForests_object = af_obj,
+        sequence.name = seq_name,
+        min.nodes = seq_min_nodes,
+        min.edges = seq_min_edges
+      )
+
+      if (!is.data.frame(seq_df)) {
+        seq_df <- as.data.frame(seq_df)
+      }
+
+      seq_df$sample_id <- sid
+      seq_df$sequence_name <- seq_name
+
+      safe_write_tsv(seq_df, out_tsv)
+
+      data.frame(
+        sample_id = sid,
+        sequence_name = seq_name,
+        output_tsv = out_tsv,
+        n_rows = nrow(seq_df),
+        status = "ok",
+        error = NA_character_,
+        stringsAsFactors = FALSE
+      )
+    }, error = function(e) {
+      data.frame(
+        sample_id = sid,
+        sequence_name = seq_name,
+        output_tsv = out_tsv,
+        n_rows = NA_integer_,
+        status = "not_available",
+        error = conditionMessage(e),
+        stringsAsFactors = FALSE
+      )
+    })
+
+    export_log <- rbind(export_log, res)
+  }
+
+  export_log
+}
+
+all_metrics_list <- list()
+all_top_list <- list()
+all_export_logs <- list()
+qc_rows <- list()
+
+for (i in seq_along(sample_ids)) {
+  sid <- sample_ids[[i]]
+  in_rds <- af_files[[i]]
+
+  sample_metrics_tsv <- file.path(metrics_by_sample_dir, paste0("Af_metrics_", sid, ".tsv"))
+  sample_top_tsv     <- file.path(metrics_by_sample_dir, paste0("Af_top_candidates_", sid, ".tsv"))
+  sample_plot_pdf    <- file.path(metrics_by_sample_dir, paste0("scatter_nrCells_vs_nrNodes_", sid, ".pdf"))
+
+  t0 <- Sys.time()
+  status <- "error"
+  err_msg <- NA_character_
+  n_metric_rows <- NA_integer_
+  n_top_rows <- NA_integer_
+  n_seq_exports_ok <- NA_integer_
+
+  tryCatch({
+    af <- readRDS(in_rds)
+
+    metric_df <- safe_metric_call(
+      af_obj = af,
+      metrics_min_nodes = metrics_min_nodes,
+      cpus = cpus
+    )
+
+    if (!is.data.frame(metric_df)) {
+      metric_df <- as.data.frame(metric_df)
+    }
+
+    if (!("tree_id" %in% colnames(metric_df))) {
+      metric_df$tree_id <- rownames(metric_df)
+    }
+    if (all(is.na(metric_df$tree_id)) || all(metric_df$tree_id == "")) {
+      metric_df$tree_id <- paste0("tree_", seq_len(nrow(metric_df)))
+    }
+
+    parsed <- lapply(metric_df$tree_id, split_key)
+    metric_df$sample_id <- sid
+    metric_df$parsed_sample <- vapply(parsed, function(x) x$sample, character(1))
+    metric_df$parsed_clonotype <- vapply(parsed, function(x) x$clonotype, character(1))
+
+    if (!("nr.nodes" %in% colnames(metric_df))) stop("Af_metrics output is missing column: nr.nodes")
+    if (!("nr.cells" %in% colnames(metric_df))) stop("Af_metrics output is missing column: nr.cells")
+
+    metric_df$priority_score_cells_x_nodes <- metric_df$nr.cells * metric_df$nr.nodes
+
+    metric_df <- metric_df[order(-metric_df$nr.cells, -metric_df$nr.nodes, -metric_df$priority_score_cells_x_nodes), , drop = FALSE]
+    n_metric_rows <- nrow(metric_df)
+
+    safe_write_tsv(metric_df, sample_metrics_tsv)
+
+    top_df <- head(metric_df, top_trees_per_sample)
+    n_top_rows <- nrow(top_df)
+    safe_write_tsv(top_df, sample_top_tsv)
+
+    lab_df <- head(metric_df, label_top_n)
+    lab_df$label <- ifelse(
+      is.na(lab_df$parsed_clonotype) | lab_df$parsed_clonotype == "",
+      lab_df$tree_id,
+      lab_df$parsed_clonotype
+    )
+
+    p <- ggplot(metric_df, aes(x = nr.cells, y = nr.nodes)) +
+      geom_point(alpha = 0.7) +
+      geom_text(
+        data = lab_df,
+        aes(label = label),
+        vjust = -0.5,
+        size = 3,
+        check_overlap = TRUE
+      ) +
+      scale_x_log10() +
+      scale_y_log10() +
+      theme_bw() +
+      labs(
+        title = paste0("Clone size versus unique variants: ", sid),
+        subtitle = paste0("Af_metrics with min.nodes = ", metrics_min_nodes),
+        x = "nr.cells",
+        y = "nr.nodes"
+      )
+
+    ggsave(filename = sample_plot_pdf, plot = p, width = 8, height = 6, units = "in")
+
+    export_log <- safe_export_sequences(
+      af_obj = af,
+      sid = sid,
+      seq_by_sample_dir = seq_by_sample_dir,
+      seq_min_nodes = seq_min_nodes,
+      seq_min_edges = seq_min_edges
+    )
+    n_seq_exports_ok <- sum(export_log$status == "ok", na.rm = TRUE)
+
+    all_metrics_list[[sid]] <- metric_df
+    all_top_list[[sid]] <- top_df
+    all_export_logs[[sid]] <- export_log
+
+    status <- "ok"
+    err_msg <- NA_character_
+
+    rm(af, metric_df, top_df, export_log, p)
+    gc()
+
+  }, error = function(e) {
+    status <<- "error"
+    err_msg <<- conditionMessage(e)
+  })
+
+  qc_rows[[length(qc_rows) + 1]] <- data.frame(
+    sample_id = sid,
+    input_rds = in_rds,
+    status = status,
+    metrics_min_nodes = metrics_min_nodes,
+    seq_min_nodes = seq_min_nodes,
+    seq_min_edges = seq_min_edges,
+    n_metric_rows = n_metric_rows,
+    n_top_rows = n_top_rows,
+    n_seq_exports_ok = n_seq_exports_ok,
+    seconds = as.numeric(difftime(Sys.time(), t0, units = "secs")),
+    error = err_msg,
+    stringsAsFactors = FALSE
+  )
+}
+
+if (length(all_metrics_list) > 0) {
+  combined_metrics <- do.call(rbind, all_metrics_list)
+  safe_write_tsv(
+    combined_metrics,
+    file.path(metrics_combined_dir, "Af_metrics_all_samples.tsv")
+  )
+
+  combined_top <- do.call(rbind, all_top_list)
+  combined_top <- combined_top[order(-combined_top$nr.cells, -combined_top$nr.nodes, -combined_top$priority_score_cells_x_nodes), , drop = FALSE]
+  safe_write_tsv(
+    combined_top,
+    file.path(metrics_combined_dir, "Af_top_candidates_all_samples.tsv")
+  )
+}
+
+if (length(all_export_logs) > 0) {
+  combined_exports <- do.call(rbind, all_export_logs)
+  safe_write_tsv(
+    combined_exports,
+    file.path(qc_dir, "Af_sequence_export_summary_by_sample.tsv")
+  )
+}
+
+qc_df <- do.call(rbind, qc_rows)
+safe_write_tsv(
+  qc_df,
+  file.path(qc_dir, "Af_metrics_summary_by_sample.tsv")
+)
+
+cat("Wrote manifest: ", manifest_path, "\n", sep = "")
+cat("Wrote QC summary: ", file.path(qc_dir, "Af_metrics_summary_by_sample.tsv"), "\n", sep = "")
+cat("Wrote sequence export summary: ", file.path(qc_dir, "Af_sequence_export_summary_by_sample.tsv"), "\n", sep = "")
+cat("Wrote per sample metrics to: ", metrics_by_sample_dir, "\n", sep = "")
+cat("Wrote combined metrics to: ", metrics_combined_dir, "\n", sep = "")
+cat("Wrote per sample sequence exports to: ", seq_by_sample_dir, "\n", sep = "")
+cat("Done\n")
+RSCRIPT
+
+echo "Finished"

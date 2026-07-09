@@ -1,0 +1,2611 @@
+---
+title: "JIA joint VDJ overlap with CoV-AbDab - updated PRIDE-style analysis"
+author: "Enno Große Wichtrup"
+date: "2026-07-08"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 14,
+  fig.height = 8,
+  dpi = 150
+)
+```
+
+# Goal
+
+Compare JIA joint antibody HCDR3 sequences against known COVID-binding antibodies from CoV-AbDab.
+
+This version keeps the JIA input logic but adds the richer CoV-AbDab comparison logic and plots from the PRIDE script:
+
+1. Exact overlap screens  
+2. Same-length HCDR3 similarity screens  
+3. Same-length + same-IGHV screens  
+4. Conservative-substitution-aware screens  
+5. Targeted indel-tolerant screens  
+6. Threshold interpretation tables  
+7. PRIDE-style scientific plots  
+
+Only JIA joint samples are included. Joint samples are defined as folders ending in `_LK` or `_RK`.
+
+# Load packages
+
+```{r load-packages}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(janitor)
+  library(readr)
+  library(stringr)
+  library(purrr)
+  library(scales)
+  library(forcats)
+  library(glue)
+})
+```
+
+# Paths and settings
+
+```{r paths-and-settings}
+# ============================================================
+# PATHS
+# ============================================================
+
+jia_vdj_root <- "/Volumes/lti/_PreClinical/Group-Yermanos/03_Projects/2025_ScSeq1_JIA/04_Processed_Data/VDJ"
+
+covabdab_dir <- "/Volumes/lti/_PreClinical/Group-Yermanos/03_Projects/2026_ScSeq2_PRIDE_Down_Sydrome_Lobke/03_Raw_Data/CoV-Databases"
+
+out_dir <- "/Volumes/lti/_PreClinical/Group-Yermanos/03_Projects/2025_ScSeq1_JIA/06_Results/VDJ/CoVAbDab_overlap_JIA_joints_PRIDE_style_updated"
+
+plot_dir <- file.path(out_dir, "plots_PRIDE_style")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Auto-detect CoV-AbDab CSV in the database folder.
+# If several versions exist, the most recently modified one is used.
+covabdab_files <- list.files(
+  covabdab_dir,
+  pattern = "CoV-AbDab.*\\.csv$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+if (length(covabdab_files) == 0) {
+  stop("No CoV-AbDab CSV found in: ", covabdab_dir)
+}
+
+covabdab_path <- covabdab_files[which.max(file.info(covabdab_files)$mtime)]
+
+cat("\nUsing CoV-AbDab file:\n")
+cat(covabdab_path, "\n")
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+joint_sample_regex <- "_(LK|RK)$"
+
+# This keeps the biological paired-cell restriction when chain-count columns exist.
+# If those columns are missing, the filter is skipped rather than failing.
+require_single_heavy_light_if_available <- TRUE
+
+# Set TRUE if you want to exactly mimic the strict PRIDE chunk and require LCDR3
+# for all screens. Default FALSE keeps all usable HCDR3s for HCDR3-based screens.
+require_lcdr3_for_all_screens <- FALSE
+
+similarity_thresholds <- c(1.00, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60)
+
+same_length_chunk_size <- 300
+
+indel_chunk_size <- 150
+indel_max_length_difference <- 1
+indel_min_cells_in_query <- 1
+indel_top_n_query <- Inf
+
+candidate_min_similarity <- 0.90
+top_n_candidates <- 25
+```
+
+# Helper functions
+
+```{r helper-functions}
+pull_first_existing <- function(df, cols, default = NA_character_) {
+  for (cc in cols) {
+    if (cc %in% colnames(df)) {
+      return(df[[cc]])
+    }
+  }
+  rep(default, nrow(df))
+}
+
+opt_chr <- function(df, col) {
+  if (col %in% colnames(df)) {
+    as.character(df[[col]])
+  } else {
+    rep(NA_character_, nrow(df))
+  }
+}
+
+as_int_safe <- function(x) {
+  suppressWarnings(as.integer(x))
+}
+
+as_num_safe <- function(x) {
+  suppressWarnings(as.numeric(x))
+}
+
+collapse_text <- function(x) {
+  vals <- unique(na.omit(as.character(x)))
+  vals <- vals[vals != ""]
+  if (length(vals) == 0) return(NA_character_)
+  paste(sort(vals), collapse = " | ")
+}
+
+collapse_unique <- function(x) {
+  vals <- unique(na.omit(as.character(x)))
+  vals <- vals[vals != ""]
+  if (length(vals) == 0) return(NA_character_)
+  paste(sort(vals), collapse = ", ")
+}
+
+safe_max_num <- function(x) {
+  x <- as_num_safe(x)
+  if (length(x) == 0 || all(is.na(x))) return(NA_real_)
+  max(x, na.rm = TRUE)
+}
+
+safe_min <- function(x, keep) {
+  if (!any(keep, na.rm = TRUE)) return(NA_real_)
+  suppressWarnings(min(x[keep], na.rm = TRUE))
+}
+
+safe_max <- function(x, keep) {
+  if (!any(keep, na.rm = TRUE)) return(NA_real_)
+  suppressWarnings(max(x[keep], na.rm = TRUE))
+}
+
+pct_keep <- function(keep) {
+  if (length(keep) == 0 || all(is.na(keep))) return(NA_real_)
+  round(100 * mean(keep, na.rm = TRUE), 3)
+}
+
+first_nonempty_token <- function(x) {
+  if (is.na(x) || x == "") return(NA_character_)
+
+  parts <- str_split(as.character(x), ";", simplify = TRUE) %>%
+    as.character() %>%
+    str_trim()
+
+  parts <- parts[parts != ""]
+  if (length(parts) == 0) return(NA_character_)
+
+  parts[1]
+}
+
+first_token_with_prefix <- function(x, prefix = "IGHV") {
+  if (is.na(x) || x == "") return(NA_character_)
+
+  parts <- str_split(as.character(x), ";", simplify = TRUE) %>%
+    as.character() %>%
+    str_trim()
+
+  parts <- parts[parts != ""]
+  if (length(parts) == 0) return(NA_character_)
+
+  pref <- parts[str_starts(str_to_upper(parts), str_to_upper(prefix))]
+
+  if (length(pref) > 0) {
+    pref[1]
+  } else {
+    parts[1]
+  }
+}
+
+norm_seq <- function(x) {
+  x %>%
+    as.character() %>%
+    str_trim() %>%
+    str_to_upper() %>%
+    str_replace_all("[^A-Z]", "") %>%
+    na_if("")
+}
+
+norm_gene_raw <- function(x) {
+  x %>%
+    as.character() %>%
+    str_trim() %>%
+    str_to_upper() %>%
+    na_if("")
+}
+
+extract_species_suffix <- function(x) {
+  raw <- norm_gene_raw(x)
+
+  species <- str_match(raw, "\\(([^\\)]+)\\)\\s*$")[, 2]
+
+  species %>%
+    str_trim() %>%
+    str_to_upper() %>%
+    na_if("")
+}
+
+clean_vgene <- function(x) {
+  x %>%
+    norm_gene_raw() %>%
+    str_remove("\\s*\\([^\\)]*\\)\\s*$") %>%
+    str_replace_all("\\s+", "") %>%
+    str_remove("\\*.*$") %>%
+    str_remove("^HUMAN[_-]") %>%
+    na_if("")
+}
+
+aa_group <- function(x) {
+  case_when(
+    x %in% c("K", "R", "H") ~ "positive",
+    x %in% c("D", "E") ~ "negative",
+    x %in% c("S", "T", "N", "Q") ~ "polar",
+    x %in% c("A", "V", "I", "L", "M") ~ "aliphatic",
+    x %in% c("F", "Y", "W") ~ "aromatic",
+    x == "C" ~ "cysteine",
+    x == "G" ~ "glycine",
+    x == "P" ~ "proline",
+    TRUE ~ "other"
+  )
+}
+
+same_length_position_metrics <- function(query_seq, db_seq) {
+  if (is.na(query_seq) || is.na(db_seq)) {
+    return(tibble(
+      exact_match_count = NA_integer_,
+      conservative_nonidentical_count = NA_integer_,
+      nonconservative_count = NA_integer_,
+      exact_fraction_same_length = NA_real_,
+      conservative_plus_exact_fraction = NA_real_
+    ))
+  }
+
+  if (nchar(query_seq) != nchar(db_seq)) {
+    return(tibble(
+      exact_match_count = NA_integer_,
+      conservative_nonidentical_count = NA_integer_,
+      nonconservative_count = NA_integer_,
+      exact_fraction_same_length = NA_real_,
+      conservative_plus_exact_fraction = NA_real_
+    ))
+  }
+
+  q <- strsplit(query_seq, "", fixed = TRUE)[[1]]
+  d <- strsplit(db_seq, "", fixed = TRUE)[[1]]
+
+  exact_match_count <- sum(q == d)
+
+  conservative_nonidentical_count <- sum(
+    q != d &
+      aa_group(q) == aa_group(d)
+  )
+
+  nonconservative_count <- sum(
+    q != d &
+      aa_group(q) != aa_group(d)
+  )
+
+  seq_len_used <- length(q)
+
+  tibble(
+    exact_match_count = exact_match_count,
+    conservative_nonidentical_count = conservative_nonidentical_count,
+    nonconservative_count = nonconservative_count,
+    exact_fraction_same_length = exact_match_count / seq_len_used,
+    conservative_plus_exact_fraction =
+      (exact_match_count + conservative_nonidentical_count) / seq_len_used
+  )
+}
+
+summarise_query_context <- function(df, group_cols) {
+  df %>%
+    group_by(across(all_of(group_cols))) %>%
+    summarise(
+      n_cells_in_your_data = n_distinct(barcode),
+      n_samples_in_your_data = n_distinct(sample_id, na.rm = TRUE),
+      n_patients_in_your_data = n_distinct(patient_id, na.rm = TRUE),
+      sample_ids_in_your_data = collapse_unique(sample_id),
+      patient_ids_in_your_data = collapse_unique(patient_id),
+      tissues_in_your_data = collapse_unique(tissue),
+      sides_in_your_data = collapse_unique(side),
+      isotypes_in_your_data = collapse_unique(isotype),
+      clonotype_ids_in_your_data = collapse_unique(clonotype_id),
+      clonotype_ids_10x_in_your_data = collapse_unique(clonotype_id_10x),
+      max_clonotype_frequency_in_your_data = safe_max_num(clonotype_frequency),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(n_cells_in_your_data), desc(n_samples_in_your_data))
+}
+
+summarise_exact_hits <- function(df, group_cols) {
+  df %>%
+    group_by(across(all_of(group_cols))) %>%
+    summarise(
+      n_cells_in_your_data = n_distinct(barcode),
+      n_samples_in_your_data = n_distinct(sample_id, na.rm = TRUE),
+      n_patients_in_your_data = n_distinct(patient_id, na.rm = TRUE),
+      sample_ids_in_your_data = collapse_unique(sample_id),
+      patient_ids_in_your_data = collapse_unique(patient_id),
+      tissues_in_your_data = collapse_unique(tissue),
+      sides_in_your_data = collapse_unique(side),
+      isotypes_in_your_data = collapse_unique(isotype),
+      clonotype_ids_in_your_data = collapse_unique(clonotype_id),
+      clonotype_ids_10x_in_your_data = collapse_unique(clonotype_id_10x),
+      max_clonotype_frequency_in_your_data = safe_max_num(clonotype_frequency),
+      matched_covabdab_names = collapse_text(db_name),
+      matched_covabdab_targets = collapse_text(db_binds_to),
+      matched_covabdab_neutralising_vs = collapse_text(db_neutralising_vs),
+      matched_covabdab_epitopes = collapse_text(db_protein_epitope),
+      matched_covabdab_origins = collapse_text(db_origin),
+      n_matching_covabdab_rows = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(n_cells_in_your_data), desc(n_samples_in_your_data))
+}
+
+split_indices_into_chunks <- function(n, chunk_size) {
+  if (n == 0) return(list())
+  split(seq_len(n), ceiling(seq_len(n) / chunk_size))
+}
+
+extract_best_counts <- function(counts_array, best_j, aliases) {
+  if (is.null(counts_array)) {
+    return(rep(NA_integer_, length(best_j)))
+  }
+
+  nm <- dimnames(counts_array)[[3]]
+
+  if (is.null(nm)) {
+    return(rep(NA_integer_, length(best_j)))
+  }
+
+  hit <- intersect(aliases, nm)
+
+  if (length(hit) == 0) {
+    return(rep(NA_integer_, length(best_j)))
+  }
+
+  k <- match(hit[1], nm)
+
+  as.integer(
+    counts_array[cbind(seq_along(best_j), best_j, rep(k, length(best_j)))]
+  )
+}
+
+seqs_to_char_matrix <- function(seqs) {
+  if (length(seqs) == 0) {
+    return(matrix(character(0), nrow = 0, ncol = 0))
+  }
+
+  split_list <- strsplit(seqs, "", fixed = TRUE)
+  lens <- lengths(split_list)
+
+  if (length(unique(lens)) != 1) {
+    stop("seqs_to_char_matrix received sequences of different lengths.")
+  }
+
+  out <- do.call(rbind, split_list)
+  mode(out) <- "character"
+  out
+}
+
+same_length_best_match_chunk <- function(query_seqs, db_seqs, match_metric = c("identity", "conservative")) {
+  match_metric <- match.arg(match_metric)
+
+  if (length(query_seqs) == 0 || length(db_seqs) == 0) {
+    return(tibble())
+  }
+
+  qmat <- seqs_to_char_matrix(query_seqs)
+  dmat <- seqs_to_char_matrix(db_seqs)
+
+  if (ncol(qmat) != ncol(dmat)) {
+    stop("same_length_best_match_chunk received query and db sequences of different lengths.")
+  }
+
+  seq_len_used <- ncol(qmat)
+
+  qgroup <- matrix(
+    aa_group(as.vector(qmat)),
+    nrow = nrow(qmat),
+    ncol = ncol(qmat)
+  )
+
+  dgroup <- matrix(
+    aa_group(as.vector(dmat)),
+    nrow = nrow(dmat),
+    ncol = ncol(dmat)
+  )
+
+  out_list <- vector("list", nrow(qmat))
+
+  for (i in seq_len(nrow(qmat))) {
+    qrow <- qmat[i, ]
+    qgroup_row <- qgroup[i, ]
+
+    qrow_mat <- matrix(
+      qrow,
+      nrow = nrow(dmat),
+      ncol = seq_len_used,
+      byrow = TRUE
+    )
+
+    qgroup_mat <- matrix(
+      qgroup_row,
+      nrow = nrow(dgroup),
+      ncol = seq_len_used,
+      byrow = TRUE
+    )
+
+    exact_vec <- rowSums(dmat == qrow_mat)
+
+    conservative_vec <- rowSums(
+      dmat != qrow_mat &
+        dgroup == qgroup_mat
+    )
+
+    nonconservative_vec <- rowSums(
+      dmat != qrow_mat &
+        dgroup != qgroup_mat
+    )
+
+    exact_fraction_vec <- exact_vec / seq_len_used
+    conservative_plus_exact_vec <- (exact_vec + conservative_vec) / seq_len_used
+
+    score_vec <- if (match_metric == "identity") {
+      exact_fraction_vec
+    } else {
+      conservative_plus_exact_vec
+    }
+
+    ranking_tbl <- tibble(
+      j = seq_along(score_vec),
+      score = score_vec,
+      exact = exact_vec,
+      conservative = conservative_vec
+    ) %>%
+      arrange(desc(score), desc(exact), desc(conservative), j)
+
+    best_j <- ranking_tbl$j[1]
+
+    out_list[[i]] <- tibble(
+      best_j = best_j,
+      best_similarity = score_vec[best_j],
+      aa_differences = seq_len_used - exact_vec[best_j],
+      exact_match_count = exact_vec[best_j],
+      conservative_nonidentical_count = conservative_vec[best_j],
+      nonconservative_count = nonconservative_vec[best_j],
+      exact_fraction_same_length = exact_fraction_vec[best_j],
+      conservative_plus_exact_fraction = conservative_plus_exact_vec[best_j]
+    )
+  }
+
+  bind_rows(out_list)
+}
+
+run_same_length_screen <- function(
+    query_tbl,
+    db_tbl,
+    require_same_ighv = FALSE,
+    chunk_size = 300,
+    match_metric = c("identity", "conservative")
+) {
+  match_metric <- match.arg(match_metric)
+
+  if (nrow(query_tbl) == 0) {
+    return(tibble())
+  }
+
+  bucket_vars <- c("query_length")
+  if (require_same_ighv) {
+    bucket_vars <- c(bucket_vars, "heavy_v_gene")
+  }
+
+  split_key <- do.call(
+    interaction,
+    c(query_tbl[bucket_vars], list(drop = TRUE, lex.order = TRUE))
+  )
+
+  query_split <- split(query_tbl, split_key)
+
+  map_dfr(query_split, function(qb) {
+    qlen <- unique(qb$query_length)
+
+    db_bucket <- db_tbl %>%
+      filter(hcdr3_length == qlen)
+
+    if (require_same_ighv) {
+      gene <- unique(qb$heavy_v_gene)
+      db_bucket <- db_bucket %>%
+        filter(heavy_v_gene == gene)
+    }
+
+    if (nrow(db_bucket) == 0) {
+      return(
+        qb %>%
+          transmute(
+            query_hcdr3 = hcdr3,
+            query_length = query_length,
+            heavy_v_gene = if ("heavy_v_gene" %in% colnames(qb)) heavy_v_gene else NA_character_,
+            best_db_hcdr3 = NA_character_,
+            best_db_length = NA_integer_,
+            best_similarity = NA_real_,
+            aa_differences = NA_integer_,
+            exact_match_count = NA_integer_,
+            conservative_nonidentical_count = NA_integer_,
+            nonconservative_count = NA_integer_,
+            exact_fraction_same_length = NA_real_,
+            conservative_plus_exact_fraction = NA_real_,
+            matched_covabdab_names = NA_character_,
+            matched_covabdab_targets = NA_character_,
+            matched_covabdab_neutralising_vs = NA_character_,
+            matched_covabdab_epitopes = NA_character_,
+            matched_covabdab_origins = NA_character_,
+            n_cells_in_your_data = n_cells_in_your_data,
+            n_samples_in_your_data = n_samples_in_your_data,
+            n_patients_in_your_data = n_patients_in_your_data,
+            sample_ids_in_your_data = sample_ids_in_your_data,
+            patient_ids_in_your_data = patient_ids_in_your_data,
+            tissues_in_your_data = tissues_in_your_data,
+            sides_in_your_data = sides_in_your_data,
+            isotypes_in_your_data = isotypes_in_your_data,
+            clonotype_ids_in_your_data = clonotype_ids_in_your_data,
+            clonotype_ids_10x_in_your_data = clonotype_ids_10x_in_your_data,
+            max_clonotype_frequency_in_your_data = max_clonotype_frequency_in_your_data
+          )
+      )
+    }
+
+    chunk_list <- split_indices_into_chunks(nrow(qb), chunk_size)
+
+    map_dfr(chunk_list, function(ix) {
+      qs <- qb[ix, , drop = FALSE]
+
+      best_tbl <- same_length_best_match_chunk(
+        query_seqs = qs$hcdr3,
+        db_seqs = db_bucket$hcdr3,
+        match_metric = match_metric
+      )
+
+      best_db <- db_bucket[best_tbl$best_j, , drop = FALSE]
+
+      tibble(
+        query_hcdr3 = qs$hcdr3,
+        query_length = qs$query_length,
+        heavy_v_gene = if ("heavy_v_gene" %in% colnames(qs)) qs$heavy_v_gene else NA_character_,
+        best_db_hcdr3 = best_db$hcdr3,
+        best_db_length = best_db$hcdr3_length,
+        matched_covabdab_names = best_db$matched_covabdab_names,
+        matched_covabdab_targets = best_db$matched_covabdab_targets,
+        matched_covabdab_neutralising_vs = best_db$matched_covabdab_neutralising_vs,
+        matched_covabdab_epitopes = best_db$matched_covabdab_epitopes,
+        matched_covabdab_origins = best_db$matched_covabdab_origins,
+        n_cells_in_your_data = qs$n_cells_in_your_data,
+        n_samples_in_your_data = qs$n_samples_in_your_data,
+        n_patients_in_your_data = qs$n_patients_in_your_data,
+        sample_ids_in_your_data = qs$sample_ids_in_your_data,
+        patient_ids_in_your_data = qs$patient_ids_in_your_data,
+        tissues_in_your_data = qs$tissues_in_your_data,
+        sides_in_your_data = qs$sides_in_your_data,
+        isotypes_in_your_data = qs$isotypes_in_your_data,
+        clonotype_ids_in_your_data = qs$clonotype_ids_in_your_data,
+        clonotype_ids_10x_in_your_data = qs$clonotype_ids_10x_in_your_data,
+        max_clonotype_frequency_in_your_data = qs$max_clonotype_frequency_in_your_data
+      ) %>%
+        bind_cols(best_tbl %>% select(-best_j))
+    })
+  }) %>%
+    arrange(desc(best_similarity), desc(n_cells_in_your_data), query_hcdr3)
+}
+
+run_targeted_indel_screen <- function(
+    query_tbl,
+    db_tbl,
+    require_same_ighv = FALSE,
+    max_length_difference = 1,
+    chunk_size = 150
+) {
+  if (nrow(query_tbl) == 0) {
+    return(tibble())
+  }
+
+  bucket_vars <- c("query_length")
+  if (require_same_ighv) {
+    bucket_vars <- c(bucket_vars, "heavy_v_gene")
+  }
+
+  split_key <- do.call(
+    interaction,
+    c(query_tbl[bucket_vars], list(drop = TRUE, lex.order = TRUE))
+  )
+
+  query_split <- split(query_tbl, split_key)
+
+  map_dfr(query_split, function(qb) {
+    qlen <- unique(qb$query_length)
+
+    db_bucket <- db_tbl %>%
+      filter(abs(hcdr3_length - qlen) <= max_length_difference)
+
+    if (require_same_ighv) {
+      gene <- unique(qb$heavy_v_gene)
+      db_bucket <- db_bucket %>%
+        filter(heavy_v_gene == gene)
+    }
+
+    if (nrow(db_bucket) == 0) {
+      return(
+        qb %>%
+          transmute(
+            query_hcdr3 = hcdr3,
+            query_length = query_length,
+            heavy_v_gene = if ("heavy_v_gene" %in% colnames(qb)) heavy_v_gene else NA_character_,
+            best_db_hcdr3 = NA_character_,
+            best_db_length = NA_integer_,
+            best_similarity = NA_real_,
+            total_edit_ops = NA_integer_,
+            n_substitutions = NA_integer_,
+            n_insertions = NA_integer_,
+            n_deletions = NA_integer_,
+            length_difference = NA_integer_,
+            exact_match_count = NA_integer_,
+            conservative_nonidentical_count = NA_integer_,
+            nonconservative_count = NA_integer_,
+            exact_fraction_same_length = NA_real_,
+            conservative_plus_exact_fraction = NA_real_,
+            matched_covabdab_names = NA_character_,
+            matched_covabdab_targets = NA_character_,
+            matched_covabdab_neutralising_vs = NA_character_,
+            matched_covabdab_epitopes = NA_character_,
+            matched_covabdab_origins = NA_character_,
+            n_cells_in_your_data = n_cells_in_your_data,
+            n_samples_in_your_data = n_samples_in_your_data,
+            n_patients_in_your_data = n_patients_in_your_data,
+            sample_ids_in_your_data = sample_ids_in_your_data,
+            patient_ids_in_your_data = patient_ids_in_your_data,
+            tissues_in_your_data = tissues_in_your_data,
+            sides_in_your_data = sides_in_your_data,
+            isotypes_in_your_data = isotypes_in_your_data,
+            clonotype_ids_in_your_data = clonotype_ids_in_your_data,
+            clonotype_ids_10x_in_your_data = clonotype_ids_10x_in_your_data,
+            max_clonotype_frequency_in_your_data = max_clonotype_frequency_in_your_data
+          )
+      )
+    }
+
+    chunk_list <- split_indices_into_chunks(nrow(qb), chunk_size)
+
+    map_dfr(chunk_list, function(ix) {
+      qs <- qb[ix, , drop = FALSE]
+
+      dmat <- utils::adist(qs$hcdr3, db_bucket$hcdr3, counts = TRUE)
+      counts_array <- attr(dmat, "counts")
+
+      denom_mat <- matrix(
+        pmax(qs$query_length[1], db_bucket$hcdr3_length),
+        nrow = nrow(dmat),
+        ncol = ncol(dmat),
+        byrow = TRUE
+      )
+
+      sim_mat <- 1 - (dmat / denom_mat)
+
+      best_j <- max.col(sim_mat, ties.method = "first")
+
+      best_dist <- as.integer(dmat[cbind(seq_len(nrow(dmat)), best_j)])
+      best_sim <- as.numeric(sim_mat[cbind(seq_len(nrow(sim_mat)), best_j)])
+
+      best_sub <- extract_best_counts(
+        counts_array = counts_array,
+        best_j = best_j,
+        aliases = c("substitutions", "subs", "sub")
+      )
+
+      best_ins <- extract_best_counts(
+        counts_array = counts_array,
+        best_j = best_j,
+        aliases = c("insertions", "ins", "insert")
+      )
+
+      best_del <- extract_best_counts(
+        counts_array = counts_array,
+        best_j = best_j,
+        aliases = c("deletions", "del", "delete")
+      )
+
+      best_db <- db_bucket[best_j, , drop = FALSE]
+
+      pos_metrics <- map2_dfr(
+        qs$hcdr3,
+        best_db$hcdr3,
+        same_length_position_metrics
+      )
+
+      tibble(
+        query_hcdr3 = qs$hcdr3,
+        query_length = qs$query_length,
+        heavy_v_gene = if ("heavy_v_gene" %in% colnames(qs)) qs$heavy_v_gene else NA_character_,
+        best_db_hcdr3 = best_db$hcdr3,
+        best_db_length = best_db$hcdr3_length,
+        best_similarity = best_sim,
+        total_edit_ops = best_dist,
+        n_substitutions = best_sub,
+        n_insertions = best_ins,
+        n_deletions = best_del,
+        length_difference = abs(qs$query_length - best_db$hcdr3_length),
+        matched_covabdab_names = best_db$matched_covabdab_names,
+        matched_covabdab_targets = best_db$matched_covabdab_targets,
+        matched_covabdab_neutralising_vs = best_db$matched_covabdab_neutralising_vs,
+        matched_covabdab_epitopes = best_db$matched_covabdab_epitopes,
+        matched_covabdab_origins = best_db$matched_covabdab_origins,
+        n_cells_in_your_data = qs$n_cells_in_your_data,
+        n_samples_in_your_data = qs$n_samples_in_your_data,
+        n_patients_in_your_data = qs$n_patients_in_your_data,
+        sample_ids_in_your_data = qs$sample_ids_in_your_data,
+        patient_ids_in_your_data = qs$patient_ids_in_your_data,
+        tissues_in_your_data = qs$tissues_in_your_data,
+        sides_in_your_data = qs$sides_in_your_data,
+        isotypes_in_your_data = qs$isotypes_in_your_data,
+        clonotype_ids_in_your_data = qs$clonotype_ids_in_your_data,
+        clonotype_ids_10x_in_your_data = qs$clonotype_ids_10x_in_your_data,
+        max_clonotype_frequency_in_your_data = qs$max_clonotype_frequency_in_your_data
+      ) %>%
+        bind_cols(pos_metrics)
+    })
+  }) %>%
+    arrange(desc(best_similarity), desc(n_cells_in_your_data), query_hcdr3)
+}
+
+make_threshold_summary <- function(tbl, comparison_name, thresholds) {
+  total_entries <- nrow(tbl)
+  total_cells <- sum(as_num_safe(tbl$n_cells_in_your_data), na.rm = TRUE)
+
+  map_dfr(thresholds, function(thr) {
+    keep <- !is.na(tbl$best_similarity) & tbl$best_similarity >= thr
+
+    tibble(
+      comparison = comparison_name,
+      similarity_threshold = thr,
+      similarity_threshold_pct = 100 * thr,
+      n_query_entries_total = total_entries,
+      n_query_entries_with_match = sum(keep),
+      pct_query_entries_with_match = ifelse(
+        total_entries > 0,
+        100 * sum(keep) / total_entries,
+        NA_real_
+      ),
+      n_query_cells_total = total_cells,
+      n_query_cells_covered_by_hit_queries = sum(as_num_safe(tbl$n_cells_in_your_data)[keep], na.rm = TRUE),
+      pct_query_cells_covered_by_hit_queries = ifelse(
+        total_cells > 0,
+        100 * sum(as_num_safe(tbl$n_cells_in_your_data)[keep], na.rm = TRUE) / total_cells,
+        NA_real_
+      ),
+      min_query_length_among_hits = safe_min(tbl$query_length, keep),
+      max_query_length_among_hits = safe_max(tbl$query_length, keep),
+      min_aa_differences_among_hits = if ("aa_differences" %in% colnames(tbl)) safe_min(tbl$aa_differences, keep) else NA_real_,
+      max_aa_differences_among_hits = if ("aa_differences" %in% colnames(tbl)) safe_max(tbl$aa_differences, keep) else NA_real_,
+      min_total_edit_ops_among_hits = if ("total_edit_ops" %in% colnames(tbl)) safe_min(tbl$total_edit_ops, keep) else NA_real_,
+      max_total_edit_ops_among_hits = if ("total_edit_ops" %in% colnames(tbl)) safe_max(tbl$total_edit_ops, keep) else NA_real_,
+      min_conservative_nonidentical_count_among_hits =
+        if ("conservative_nonidentical_count" %in% colnames(tbl)) safe_min(tbl$conservative_nonidentical_count, keep) else NA_real_,
+      max_conservative_nonidentical_count_among_hits =
+        if ("conservative_nonidentical_count" %in% colnames(tbl)) safe_max(tbl$conservative_nonidentical_count, keep) else NA_real_,
+      min_nonconservative_count_among_hits =
+        if ("nonconservative_count" %in% colnames(tbl)) safe_min(tbl$nonconservative_count, keep) else NA_real_,
+      max_nonconservative_count_among_hits =
+        if ("nonconservative_count" %in% colnames(tbl)) safe_max(tbl$nonconservative_count, keep) else NA_real_
+    )
+  })
+}
+
+threshold_label <- function(thr) {
+  paste0(round(100 * thr), "pct")
+}
+
+read_vdj_build <- function(path) {
+  obj <- readRDS(path)
+
+  if (is.data.frame(obj)) {
+    df <- as_tibble(obj)
+  } else if (is.list(obj) && "VDJ" %in% names(obj) && is.data.frame(obj$VDJ)) {
+    df <- as_tibble(obj$VDJ)
+  } else {
+    stop("Unsupported RDS structure in: ", path)
+  }
+
+  df %>%
+    mutate(
+      source_file = path,
+      source_dir_sample = basename(dirname(path))
+    )
+}
+
+wrap_lab <- function(x, width = 78) {
+  stringr::str_wrap(x, width = width)
+}
+
+shorten_sequence <- function(x, max_width = 24) {
+  x <- as.character(x)
+
+  ifelse(
+    is.na(x),
+    NA_character_,
+    ifelse(
+      nchar(x) <= max_width,
+      x,
+      paste0(substr(x, 1, max_width - 3), "...")
+    )
+  )
+}
+
+clean_pct_label <- function(x) {
+  ifelse(
+    is.na(x),
+    "NA",
+    paste0(format(round(x, 3), nsmall = 3), "%")
+  )
+}
+
+save_plot <- function(plot, filename, width = 14, height = 8, dpi = 350) {
+  path <- file.path(plot_dir, filename)
+
+  plot <- plot +
+    theme(
+      text = element_text(size = 18),
+      plot.title.position = "plot",
+      plot.caption.position = "plot",
+      plot.title = element_text(
+        size = 22,
+        face = "bold",
+        lineheight = 1.05,
+        margin = margin(b = 12)
+      ),
+      plot.subtitle = element_text(
+        size = 16,
+        lineheight = 1.12,
+        margin = margin(b = 20)
+      ),
+      axis.title.x = element_text(
+        size = 17,
+        margin = margin(t = 16)
+      ),
+      axis.title.y = element_text(
+        size = 17,
+        margin = margin(r = 22)
+      ),
+      axis.text.x = element_text(size = 15),
+      axis.text.y = element_text(size = 15),
+      strip.text = element_text(
+        size = 15,
+        face = "bold",
+        margin = margin(t = 8, b = 8)
+      ),
+      legend.title = element_text(size = 16),
+      legend.text = element_text(size = 15),
+      plot.caption = element_text(
+        size = 13,
+        hjust = 0,
+        lineheight = 1.08,
+        margin = margin(t = 18)
+      ),
+      plot.margin = margin(t = 38, r = 55, b = 40, l = 55)
+    )
+
+  if (requireNamespace("ragg", quietly = TRUE)) {
+    ggsave(
+      filename = path,
+      plot = plot,
+      width = width,
+      height = height,
+      dpi = dpi,
+      device = ragg::agg_png,
+      bg = "white",
+      limitsize = FALSE
+    )
+  } else {
+    ggsave(
+      filename = path,
+      plot = plot,
+      width = width,
+      height = height,
+      dpi = dpi,
+      bg = "white",
+      limitsize = FALSE
+    )
+  }
+
+  cat("Saved: ", path, "\n", sep = "")
+}
+```
+
+# Load JIA joint VDJ_build files
+
+```{r load-jia-joint-vdj}
+vdj_files_all <- list.files(
+  jia_vdj_root,
+  pattern = "^VDJ_build_.*\\.rds\\.xz$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+if (length(vdj_files_all) == 0) {
+  stop("No VDJ_build_*.rds.xz files found in: ", jia_vdj_root)
+}
+
+vdj_files_joint <- vdj_files_all[
+  str_detect(basename(dirname(vdj_files_all)), joint_sample_regex)
+]
+
+if (length(vdj_files_joint) == 0) {
+  stop("No joint VDJ_build files found. Expected parent folders ending in _LK or _RK.")
+}
+
+cat("\nJoint VDJ files included:\n")
+print(vdj_files_joint)
+
+cat("\nVDJ files excluded:\n")
+print(setdiff(vdj_files_all, vdj_files_joint))
+
+vdj_all <- map_dfr(vdj_files_joint, read_vdj_build)
+
+cat("\nRows loaded from joint VDJ_build files:\n")
+cat(nrow(vdj_all), "\n")
+
+cat("\nColumns available in loaded JIA VDJ data:\n")
+print(colnames(vdj_all))
+
+# Make sure a sample id exists.
+if (!"sample_id" %in% colnames(vdj_all)) {
+  vdj_all$sample_id <- NA_character_
+}
+
+vdj_all <- vdj_all %>%
+  mutate(
+    sample_id = as.character(sample_id),
+    sample_id = if_else(
+      is.na(sample_id) | sample_id == "",
+      as.character(source_dir_sample),
+      sample_id
+    )
+  )
+
+cat("\nRows per source folder/sample before filtering:\n")
+vdj_all %>%
+  count(source_dir_sample, sample_id, sort = TRUE) %>%
+  print(n = 100)
+```
+
+# Load and clean CoV-AbDab
+
+```{r load-and-clean-covabdab}
+covabdab <- read_csv(covabdab_path, show_col_types = FALSE) %>%
+  clean_names()
+
+cat("\nCoV-AbDab columns after clean_names():\n")
+print(colnames(covabdab))
+
+required_db_cols <- c("name", "cdrh3", "heavy_v_gene")
+missing_db_cols <- setdiff(required_db_cols, colnames(covabdab))
+
+if (length(missing_db_cols) > 0) {
+  stop("Missing required columns in CoV-AbDab file: ", paste(missing_db_cols, collapse = ", "))
+}
+
+db_all <- covabdab %>%
+  transmute(
+    db_name = opt_chr(covabdab, "name"),
+    db_ab_or_nb = opt_chr(covabdab, "ab_or_nb"),
+    db_binds_to = opt_chr(covabdab, "binds_to"),
+    db_neutralising_vs = opt_chr(covabdab, "neutralising_vs"),
+    db_protein_epitope = opt_chr(covabdab, "protein_epitope"),
+    db_origin = opt_chr(covabdab, "origin"),
+
+    hcdr3 = norm_seq(opt_chr(covabdab, "cdrh3")),
+    lcdr3 = norm_seq(opt_chr(covabdab, "cdrl3")),
+
+    heavy_v_gene_raw = norm_gene_raw(opt_chr(covabdab, "heavy_v_gene")),
+    light_v_gene_raw = norm_gene_raw(opt_chr(covabdab, "light_v_gene"))
+  ) %>%
+  mutate(
+    heavy_species = extract_species_suffix(heavy_v_gene_raw),
+    light_species = extract_species_suffix(light_v_gene_raw),
+    heavy_v_gene = clean_vgene(heavy_v_gene_raw),
+    light_v_gene = clean_vgene(light_v_gene_raw)
+  ) %>%
+  filter(!is.na(hcdr3), hcdr3 != "") %>%
+  mutate(
+    hcdr3_length = nchar(hcdr3)
+  )
+
+# HCDR3-only analyses use all entries.
+# IGHV-restricted analyses use human or unspecified heavy V genes.
+db_human_vgenes <- db_all %>%
+  filter(is.na(heavy_species) | heavy_species == "HUMAN")
+
+db_hcdr3_unique <- db_all %>%
+  group_by(hcdr3) %>%
+  summarise(
+    hcdr3_length = nchar(first(hcdr3)),
+    matched_covabdab_names = collapse_text(db_name),
+    matched_covabdab_targets = collapse_text(db_binds_to),
+    matched_covabdab_neutralising_vs = collapse_text(db_neutralising_vs),
+    matched_covabdab_epitopes = collapse_text(db_protein_epitope),
+    matched_covabdab_origins = collapse_text(db_origin),
+    heavy_v_gene = collapse_text(heavy_v_gene),
+    .groups = "drop"
+  )
+
+db_hcdr3_ighv_unique <- db_human_vgenes %>%
+  filter(!is.na(heavy_v_gene), heavy_v_gene != "") %>%
+  group_by(hcdr3, heavy_v_gene) %>%
+  summarise(
+    hcdr3_length = nchar(first(hcdr3)),
+    matched_covabdab_names = collapse_text(db_name),
+    matched_covabdab_targets = collapse_text(db_binds_to),
+    matched_covabdab_neutralising_vs = collapse_text(db_neutralising_vs),
+    matched_covabdab_epitopes = collapse_text(db_protein_epitope),
+    matched_covabdab_origins = collapse_text(db_origin),
+    .groups = "drop"
+  )
+
+cat("\nCoV-AbDab rows with usable HCDR3:\n")
+cat(nrow(db_all), "\n")
+
+cat("\nCoV-AbDab rows used for IGHV-restricted matching, human or unspecified heavy V:\n")
+cat(nrow(db_human_vgenes), "\n")
+```
+
+# Prepare JIA query cells
+
+```{r prepare-jia-query-cells}
+vdj_cdr3_col <- intersect(c("VDJ_cdr3_aa", "VDJ_cdr3s_aa"), colnames(vdj_all))[1]
+vj_cdr3_col <- intersect(c("VJ_cdr3_aa", "VJ_cdr3s_aa"), colnames(vdj_all))[1]
+vdj_vgene_col <- intersect(c("VDJ_vgene", "VDJ_vgenes"), colnames(vdj_all))[1]
+vj_vgene_col <- intersect(c("VJ_vgene", "VJ_vgenes"), colnames(vdj_all))[1]
+
+if (is.na(vdj_cdr3_col)) {
+  stop("Could not find a heavy-chain amino acid CDR3 column. Expected VDJ_cdr3_aa or VDJ_cdr3s_aa.")
+}
+
+if (is.na(vdj_vgene_col)) {
+  stop("Could not find a heavy-chain V gene column. Expected VDJ_vgene or VDJ_vgenes.")
+}
+
+query_cells_raw <- tibble(
+  barcode = as.character(pull_first_existing(vdj_all, c("barcode", "cell_id"))),
+  sample_id = as.character(pull_first_existing(vdj_all, c("sample_id"))),
+  patient_id = as.character(pull_first_existing(vdj_all, c("patient_id", "patient"))),
+  tissue = as.character(pull_first_existing(vdj_all, c("tissue"))),
+  side = as.character(pull_first_existing(vdj_all, c("side"))),
+  source_dir_sample = as.character(pull_first_existing(vdj_all, c("source_dir_sample"))),
+
+  isotype = as.character(pull_first_existing(vdj_all, c("isotype", "isotype_class", "main_isotype"))),
+  clonotype_id = as.character(pull_first_existing(vdj_all, c("clonotype_id"))),
+  clonotype_id_10x = as.character(pull_first_existing(vdj_all, c("clonotype_id_10x"))),
+  clonotype_frequency = as_num_safe(pull_first_existing(vdj_all, c("clonotype_frequency", "clone_frequency", "clone_size"))),
+
+  VDJ_chain_count = as_int_safe(pull_first_existing(vdj_all, c("VDJ_chain_count", "Nr_of_VDJ_chains"))),
+  VJ_chain_count = as_int_safe(pull_first_existing(vdj_all, c("VJ_chain_count", "Nr_of_VJ_chains"))),
+
+  hcdr3 = norm_seq(vapply(
+    pull_first_existing(vdj_all, c("VDJ_cdr3_aa", "VDJ_cdr3s_aa")),
+    first_nonempty_token,
+    character(1)
+  )),
+
+  lcdr3 = norm_seq(vapply(
+    pull_first_existing(vdj_all, c("VJ_cdr3_aa", "VJ_cdr3s_aa")),
+    first_nonempty_token,
+    character(1)
+  )),
+
+  heavy_v_gene_raw = norm_gene_raw(vapply(
+    pull_first_existing(vdj_all, c("VDJ_vgene", "VDJ_vgenes")),
+    first_token_with_prefix,
+    character(1),
+    prefix = "IGHV"
+  )),
+
+  heavy_v_gene = clean_vgene(vapply(
+    pull_first_existing(vdj_all, c("VDJ_vgene", "VDJ_vgenes")),
+    first_token_with_prefix,
+    character(1),
+    prefix = "IGHV"
+  )),
+
+  light_v_gene_raw = norm_gene_raw(vapply(
+    pull_first_existing(vdj_all, c("VJ_vgene", "VJ_vgenes")),
+    first_token_with_prefix,
+    character(1),
+    prefix = "IG"
+  )),
+
+  light_v_gene = clean_vgene(vapply(
+    pull_first_existing(vdj_all, c("VJ_vgene", "VJ_vgenes")),
+    first_token_with_prefix,
+    character(1),
+    prefix = "IG"
+  ))
+) %>%
+  filter(!is.na(hcdr3), hcdr3 != "")
+
+if (require_single_heavy_light_if_available) {
+  query_cells <- query_cells_raw %>%
+    filter(
+      is.na(VDJ_chain_count) | VDJ_chain_count == 1,
+      is.na(VJ_chain_count) | VJ_chain_count == 1
+    )
+} else {
+  query_cells <- query_cells_raw
+}
+
+if (require_lcdr3_for_all_screens) {
+  query_cells <- query_cells %>%
+    filter(!is.na(lcdr3), lcdr3 != "")
+}
+
+query_cells <- query_cells %>%
+  mutate(
+    query_length = nchar(hcdr3)
+  ) %>%
+  distinct()
+
+cat("\nCells kept for CoV-AbDab comparison:\n")
+cat(nrow(query_cells), "\n")
+
+cat("\nUnique receptor counts after filtering:\n")
+cat("Unique HCDR3:", nrow(query_cells %>% distinct(hcdr3)), "\n")
+cat("Unique HCDR3 plus IGHV:", nrow(query_cells %>% filter(!is.na(heavy_v_gene), heavy_v_gene != "") %>% distinct(hcdr3, heavy_v_gene)), "\n")
+cat("Unique paired HCDR3 plus LCDR3:", nrow(query_cells %>% filter(!is.na(lcdr3), lcdr3 != "") %>% distinct(hcdr3, lcdr3)), "\n")
+cat("Unique paired HCDR3 plus LCDR3 plus IGHV plus IGLV:",
+    nrow(query_cells %>%
+           filter(
+             !is.na(lcdr3), lcdr3 != "",
+             !is.na(heavy_v_gene), heavy_v_gene != "",
+             !is.na(light_v_gene), light_v_gene != ""
+           ) %>%
+           distinct(hcdr3, lcdr3, heavy_v_gene, light_v_gene)),
+    "\n")
+
+cat("\nRows per JIA joint sample after filtering:\n")
+query_cells %>%
+  count(sample_id, patient_id, tissue, side, sort = TRUE) %>%
+  print(n = 100)
+
+write_csv(
+  query_cells,
+  file.path(out_dir, "jia_joint_query_cells_used.csv")
+)
+```
+
+# Build unique query tables
+
+```{r build-unique-query-tables}
+query_hcdr3_unique <- query_cells %>%
+  summarise_query_context(group_cols = c("hcdr3", "query_length")) %>%
+  arrange(desc(n_cells_in_your_data), desc(n_samples_in_your_data), hcdr3)
+
+query_hcdr3_ighv_unique <- query_cells %>%
+  filter(!is.na(heavy_v_gene), heavy_v_gene != "") %>%
+  summarise_query_context(group_cols = c("hcdr3", "query_length", "heavy_v_gene")) %>%
+  arrange(desc(n_cells_in_your_data), desc(n_samples_in_your_data), hcdr3)
+
+cat("\nUnique HCDR3 tables built:\n")
+cat("HCDR3 only:", nrow(query_hcdr3_unique), "\n")
+cat("HCDR3 plus IGHV:", nrow(query_hcdr3_ighv_unique), "\n")
+
+write_csv(query_hcdr3_unique, file.path(out_dir, "query_unique_hcdr3.csv"))
+write_csv(query_hcdr3_ighv_unique, file.path(out_dir, "query_unique_hcdr3_plus_ighv.csv"))
+```
+
+# Gene harmonization sanity check
+
+```{r gene-harmonization-sanity-check}
+query_ighv_values <- sort(unique(na.omit(query_cells$heavy_v_gene)))
+db_ighv_values <- sort(unique(na.omit(db_human_vgenes$heavy_v_gene)))
+ighv_overlap_values <- sort(intersect(query_ighv_values, db_ighv_values))
+
+cat("\nIGHV harmonization sanity check:\n")
+cat("Unique query IGHV:", length(query_ighv_values), "\n")
+cat("Unique CoV-AbDab HUMAN/unspecified IGHV:", length(db_ighv_values), "\n")
+cat("Exact overlap of harmonized IGHV values:", length(ighv_overlap_values), "\n")
+
+cat("\nExample overlapping IGHV values:\n")
+print(head(ighv_overlap_values, 30))
+
+write_csv(tibble(query_ighv = query_ighv_values), file.path(out_dir, "query_ighv_values_harmonized.csv"))
+write_csv(tibble(covabdab_human_ighv = db_ighv_values), file.path(out_dir, "covabdab_human_ighv_values_harmonized.csv"))
+write_csv(tibble(overlapping_ighv = ighv_overlap_values), file.path(out_dir, "overlapping_ighv_values_harmonized.csv"))
+```
+
+# Exact match analyses
+
+```{r exact-match-analyses}
+hits_exact_hcdr3 <- query_cells %>%
+  inner_join(db_all, by = "hcdr3") %>%
+  summarise_exact_hits(group_cols = c("hcdr3"))
+
+hits_exact_hcdr3_ighv <- query_cells %>%
+  filter(!is.na(heavy_v_gene), heavy_v_gene != "") %>%
+  inner_join(
+    db_human_vgenes %>% filter(!is.na(heavy_v_gene), heavy_v_gene != ""),
+    by = c("hcdr3", "heavy_v_gene")
+  ) %>%
+  summarise_exact_hits(group_cols = c("hcdr3", "heavy_v_gene"))
+
+hits_exact_pair <- query_cells %>%
+  filter(!is.na(lcdr3), lcdr3 != "") %>%
+  inner_join(
+    db_all %>% filter(!is.na(lcdr3), lcdr3 != ""),
+    by = c("hcdr3", "lcdr3")
+  ) %>%
+  summarise_exact_hits(group_cols = c("hcdr3", "lcdr3"))
+
+hits_exact_pair_v <- query_cells %>%
+  filter(
+    !is.na(lcdr3), lcdr3 != "",
+    !is.na(heavy_v_gene), heavy_v_gene != "",
+    !is.na(light_v_gene), light_v_gene != ""
+  ) %>%
+  inner_join(
+    db_human_vgenes %>%
+      filter(
+        !is.na(lcdr3), lcdr3 != "",
+        !is.na(heavy_v_gene), heavy_v_gene != "",
+        !is.na(light_v_gene), light_v_gene != ""
+      ),
+    by = c("hcdr3", "lcdr3", "heavy_v_gene", "light_v_gene")
+  ) %>%
+  summarise_exact_hits(group_cols = c("hcdr3", "lcdr3", "heavy_v_gene", "light_v_gene"))
+
+exact_summary_tbl <- tibble(
+  comparison = c(
+    "Exact HCDR3",
+    "Exact HCDR3 plus IGHV",
+    "Exact paired HCDR3 plus LCDR3",
+    "Exact paired HCDR3 plus LCDR3 plus IGHV plus IGLV"
+  ),
+  n_query_unique = c(
+    nrow(query_cells %>% distinct(hcdr3)),
+    nrow(query_cells %>% filter(!is.na(heavy_v_gene), heavy_v_gene != "") %>% distinct(hcdr3, heavy_v_gene)),
+    nrow(query_cells %>% filter(!is.na(lcdr3), lcdr3 != "") %>% distinct(hcdr3, lcdr3)),
+    nrow(query_cells %>%
+           filter(
+             !is.na(lcdr3), lcdr3 != "",
+             !is.na(heavy_v_gene), heavy_v_gene != "",
+             !is.na(light_v_gene), light_v_gene != ""
+           ) %>%
+           distinct(hcdr3, lcdr3, heavy_v_gene, light_v_gene))
+  ),
+  n_covabdab_unique = c(
+    nrow(db_all %>% distinct(hcdr3)),
+    nrow(db_human_vgenes %>% filter(!is.na(heavy_v_gene), heavy_v_gene != "") %>% distinct(hcdr3, heavy_v_gene)),
+    nrow(db_all %>% filter(!is.na(lcdr3), lcdr3 != "") %>% distinct(hcdr3, lcdr3)),
+    nrow(db_human_vgenes %>%
+           filter(
+             !is.na(lcdr3), lcdr3 != "",
+             !is.na(heavy_v_gene), heavy_v_gene != "",
+             !is.na(light_v_gene), light_v_gene != ""
+           ) %>%
+           distinct(hcdr3, lcdr3, heavy_v_gene, light_v_gene))
+  ),
+  n_query_entries_with_match = c(
+    nrow(hits_exact_hcdr3),
+    nrow(hits_exact_hcdr3_ighv),
+    nrow(hits_exact_pair),
+    nrow(hits_exact_pair_v)
+  )
+) %>%
+  mutate(
+    pct_query_entries_with_match = if_else(
+      n_query_unique > 0,
+      round(100 * n_query_entries_with_match / n_query_unique, 3),
+      NA_real_
+    )
+  )
+
+cat("\nExact match summary:\n")
+print(exact_summary_tbl)
+
+cat("\nTop exact HCDR3-only hits:\n")
+print(hits_exact_hcdr3, n = 30)
+
+cat("\nTop exact HCDR3 + IGHV hits:\n")
+print(hits_exact_hcdr3_ighv, n = 30)
+
+write_csv(exact_summary_tbl, file.path(out_dir, "exact_match_summary.csv"))
+write_csv(hits_exact_hcdr3, file.path(out_dir, "hits_exact_hcdr3.csv"))
+write_csv(hits_exact_hcdr3_ighv, file.path(out_dir, "hits_exact_hcdr3_plus_ighv.csv"))
+write_csv(hits_exact_pair, file.path(out_dir, "hits_exact_paired_hcdr3_lcdr3.csv"))
+write_csv(hits_exact_pair_v, file.path(out_dir, "hits_exact_paired_hcdr3_lcdr3_ighv_iglv.csv"))
+```
+
+# Length interpretation tables
+
+```{r length-interpretation-tables}
+observed_lengths <- sort(unique(query_hcdr3_unique$query_length))
+
+length_effect_tbl <- tibble(
+  cdr3_length = observed_lengths,
+  similarity_if_1_difference_same_length = round(1 - (1 / cdr3_length), 3),
+  similarity_if_2_differences_same_length = round(1 - (2 / cdr3_length), 3),
+  similarity_if_3_differences_same_length = round(1 - (3 / cdr3_length), 3)
+)
+
+threshold_interpretation_tbl <- tidyr::expand_grid(
+  cdr3_length = observed_lengths,
+  similarity_threshold = similarity_thresholds
+) %>%
+  mutate(
+    max_aa_differences_if_same_length =
+      floor((1 - similarity_threshold) * cdr3_length)
+  ) %>%
+  arrange(cdr3_length, desc(similarity_threshold))
+
+cat("\nLength effect table preview:\n")
+print(length_effect_tbl, n = 30)
+
+cat("\nThreshold interpretation preview:\n")
+print(threshold_interpretation_tbl, n = 50)
+
+write_csv(length_effect_tbl, file.path(out_dir, "cdr3_length_effect_table.csv"))
+write_csv(threshold_interpretation_tbl, file.path(out_dir, "cdr3_threshold_interpretation_table.csv"))
+```
+
+# Same-length identity screens
+
+```{r same-length-identity-screens}
+cat("\nRunning same-length HCDR3 screen optimized for exact positional identity...\n")
+
+same_length_all_tbl <- run_same_length_screen(
+  query_tbl = query_hcdr3_unique,
+  db_tbl = db_hcdr3_unique,
+  require_same_ighv = FALSE,
+  chunk_size = same_length_chunk_size,
+  match_metric = "identity"
+)
+
+cat("Finished same-length HCDR3 identity screen.\n")
+
+cat("\nRunning same-length HCDR3 + same IGHV screen optimized for exact positional identity...\n")
+
+same_length_ighv_tbl <- run_same_length_screen(
+  query_tbl = query_hcdr3_ighv_unique,
+  db_tbl = db_hcdr3_ighv_unique,
+  require_same_ighv = TRUE,
+  chunk_size = same_length_chunk_size,
+  match_metric = "identity"
+)
+
+cat("Finished same-length HCDR3 + same IGHV identity screen.\n")
+
+cat("\nTop same-length HCDR3 identity hits:\n")
+same_length_all_tbl %>%
+  select(
+    query_hcdr3, query_length,
+    best_db_hcdr3, best_db_length,
+    best_similarity, aa_differences,
+    conservative_plus_exact_fraction,
+    conservative_nonidentical_count,
+    nonconservative_count,
+    n_cells_in_your_data,
+    n_samples_in_your_data,
+    sample_ids_in_your_data,
+    matched_covabdab_names,
+    matched_covabdab_targets
+  ) %>%
+  slice_head(n = 30) %>%
+  print(n = 30)
+
+cat("\nTop same-length HCDR3 + IGHV identity hits:\n")
+same_length_ighv_tbl %>%
+  select(
+    query_hcdr3, query_length, heavy_v_gene,
+    best_db_hcdr3, best_db_length,
+    best_similarity, aa_differences,
+    conservative_plus_exact_fraction,
+    conservative_nonidentical_count,
+    nonconservative_count,
+    n_cells_in_your_data,
+    n_samples_in_your_data,
+    sample_ids_in_your_data,
+    matched_covabdab_names,
+    matched_covabdab_targets
+  ) %>%
+  slice_head(n = 30) %>%
+  print(n = 30)
+
+write_csv(same_length_all_tbl, file.path(out_dir, "same_length_hcdr3_all_unique_queries.csv"))
+write_csv(same_length_ighv_tbl, file.path(out_dir, "same_length_hcdr3_plus_ighv.csv"))
+```
+
+# Same-length conservative substitution screens
+
+```{r same-length-conservative-screens}
+cat("\nRunning same-length HCDR3 screen optimized for conservative + exact positional score...\n")
+
+same_length_all_conservative_tbl <- run_same_length_screen(
+  query_tbl = query_hcdr3_unique,
+  db_tbl = db_hcdr3_unique,
+  require_same_ighv = FALSE,
+  chunk_size = same_length_chunk_size,
+  match_metric = "conservative"
+)
+
+cat("Finished same-length HCDR3 conservative screen.\n")
+
+cat("\nRunning same-length HCDR3 + same IGHV screen optimized for conservative + exact positional score...\n")
+
+same_length_ighv_conservative_tbl <- run_same_length_screen(
+  query_tbl = query_hcdr3_ighv_unique,
+  db_tbl = db_hcdr3_ighv_unique,
+  require_same_ighv = TRUE,
+  chunk_size = same_length_chunk_size,
+  match_metric = "conservative"
+)
+
+cat("Finished same-length HCDR3 + same IGHV conservative screen.\n")
+
+cat("\nTop same-length HCDR3 conservative hits:\n")
+same_length_all_conservative_tbl %>%
+  select(
+    query_hcdr3, query_length,
+    best_db_hcdr3, best_db_length,
+    best_similarity,
+    exact_fraction_same_length,
+    aa_differences,
+    conservative_nonidentical_count,
+    nonconservative_count,
+    n_cells_in_your_data,
+    n_samples_in_your_data,
+    matched_covabdab_names,
+    matched_covabdab_targets
+  ) %>%
+  slice_head(n = 30) %>%
+  print(n = 30)
+
+cat("\nTop same-length HCDR3 + IGHV conservative hits:\n")
+same_length_ighv_conservative_tbl %>%
+  select(
+    query_hcdr3, query_length, heavy_v_gene,
+    best_db_hcdr3, best_db_length,
+    best_similarity,
+    exact_fraction_same_length,
+    aa_differences,
+    conservative_nonidentical_count,
+    nonconservative_count,
+    n_cells_in_your_data,
+    n_samples_in_your_data,
+    matched_covabdab_names,
+    matched_covabdab_targets
+  ) %>%
+  slice_head(n = 30) %>%
+  print(n = 30)
+
+write_csv(same_length_all_conservative_tbl, file.path(out_dir, "same_length_hcdr3_conservative_all_unique_queries.csv"))
+write_csv(same_length_ighv_conservative_tbl, file.path(out_dir, "same_length_hcdr3_plus_ighv_conservative.csv"))
+```
+
+# Sanity checks for same-length screens
+
+```{r same-length-sanity-checks}
+cat("\nSanity checks for same-length screens:\n")
+
+identity_sanity_tbl <- tibble(similarity_threshold = similarity_thresholds) %>%
+  rowwise() %>%
+  mutate(
+    n_identity = sum(same_length_all_tbl$best_similarity >= similarity_threshold, na.rm = TRUE),
+    n_conservative_same_best_pair = sum(
+      same_length_all_tbl$conservative_plus_exact_fraction >= similarity_threshold,
+      na.rm = TRUE
+    )
+  ) %>%
+  ungroup()
+
+print(identity_sanity_tbl)
+
+cat("\nAny same-length identity rows where conservative_plus_exact_fraction < exact_fraction_same_length?\n")
+same_length_all_tbl %>%
+  summarise(
+    any_bad = any(conservative_plus_exact_fraction < exact_fraction_same_length, na.rm = TRUE)
+  ) %>%
+  print()
+
+cat("\nAny same-length conservative rows where conservative_plus_exact_fraction < exact_fraction_same_length?\n")
+same_length_all_conservative_tbl %>%
+  summarise(
+    any_bad = any(conservative_plus_exact_fraction < exact_fraction_same_length, na.rm = TRUE)
+  ) %>%
+  print()
+```
+
+# Targeted indel-tolerant screens
+
+```{r targeted-indel-screens}
+indel_query_all_tbl <- query_hcdr3_unique %>%
+  filter(n_cells_in_your_data >= indel_min_cells_in_query) %>%
+  slice_head(n = indel_top_n_query)
+
+cat("\nTargeted indel screen query size without IGHV restriction:\n")
+cat("Unique query HCDR3 used for indel screen:", nrow(indel_query_all_tbl), "\n")
+
+cat("\nRunning targeted indel screen without IGHV restriction...\n")
+
+targeted_indel_all_tbl <- run_targeted_indel_screen(
+  query_tbl = indel_query_all_tbl,
+  db_tbl = db_hcdr3_unique,
+  require_same_ighv = FALSE,
+  max_length_difference = indel_max_length_difference,
+  chunk_size = indel_chunk_size
+)
+
+cat("Finished targeted indel screen without IGHV restriction.\n")
+
+indel_query_ighv_tbl <- query_hcdr3_ighv_unique %>%
+  filter(n_cells_in_your_data >= indel_min_cells_in_query) %>%
+  slice_head(n = indel_top_n_query)
+
+cat("\nTargeted indel screen query size with same IGHV restriction:\n")
+cat("Unique query HCDR3 plus IGHV used for indel screen:", nrow(indel_query_ighv_tbl), "\n")
+
+cat("\nRunning targeted indel screen with same IGHV restriction...\n")
+
+targeted_indel_ighv_tbl <- run_targeted_indel_screen(
+  query_tbl = indel_query_ighv_tbl,
+  db_tbl = db_hcdr3_ighv_unique,
+  require_same_ighv = TRUE,
+  max_length_difference = indel_max_length_difference,
+  chunk_size = indel_chunk_size
+)
+
+cat("Finished targeted indel screen with same IGHV restriction.\n")
+
+cat("\nTop targeted indel hits without IGHV restriction:\n")
+targeted_indel_all_tbl %>%
+  select(
+    query_hcdr3, query_length,
+    best_db_hcdr3, best_db_length,
+    best_similarity,
+    total_edit_ops,
+    n_substitutions, n_insertions, n_deletions,
+    length_difference,
+    conservative_plus_exact_fraction,
+    n_cells_in_your_data,
+    n_samples_in_your_data,
+    matched_covabdab_names,
+    matched_covabdab_targets
+  ) %>%
+  slice_head(n = 30) %>%
+  print(n = 30)
+
+cat("\nTop targeted indel hits with same IGHV restriction:\n")
+targeted_indel_ighv_tbl %>%
+  select(
+    query_hcdr3, query_length, heavy_v_gene,
+    best_db_hcdr3, best_db_length,
+    best_similarity,
+    total_edit_ops,
+    n_substitutions, n_insertions, n_deletions,
+    length_difference,
+    conservative_plus_exact_fraction,
+    n_cells_in_your_data,
+    n_samples_in_your_data,
+    matched_covabdab_names,
+    matched_covabdab_targets
+  ) %>%
+  slice_head(n = 30) %>%
+  print(n = 30)
+
+write_csv(targeted_indel_all_tbl, file.path(out_dir, "targeted_indel_hcdr3_all_unique_queries.csv"))
+write_csv(targeted_indel_ighv_tbl, file.path(out_dir, "targeted_indel_hcdr3_plus_ighv.csv"))
+```
+
+# Threshold summaries
+
+```{r threshold-summaries}
+same_length_all_threshold_tbl <- make_threshold_summary(
+  same_length_all_tbl,
+  comparison_name = "Same length HCDR3",
+  thresholds = similarity_thresholds
+)
+
+same_length_ighv_threshold_tbl <- make_threshold_summary(
+  same_length_ighv_tbl,
+  comparison_name = "Same length HCDR3 plus IGHV",
+  thresholds = similarity_thresholds
+)
+
+same_length_conservative_threshold_tbl_all <- make_threshold_summary(
+  same_length_all_conservative_tbl,
+  comparison_name = "Same length HCDR3 conservative score",
+  thresholds = similarity_thresholds
+)
+
+same_length_conservative_threshold_tbl_ighv <- make_threshold_summary(
+  same_length_ighv_conservative_tbl,
+  comparison_name = "Same length HCDR3 plus IGHV conservative score",
+  thresholds = similarity_thresholds
+)
+
+targeted_indel_threshold_tbl_all <- make_threshold_summary(
+  targeted_indel_all_tbl,
+  comparison_name = "Targeted indel tolerant HCDR3",
+  thresholds = similarity_thresholds
+)
+
+targeted_indel_threshold_tbl_ighv <- make_threshold_summary(
+  targeted_indel_ighv_tbl,
+  comparison_name = "Targeted indel tolerant HCDR3 plus IGHV",
+  thresholds = similarity_thresholds
+)
+
+all_threshold_summaries_tbl <- bind_rows(
+  same_length_all_threshold_tbl,
+  same_length_ighv_threshold_tbl,
+  same_length_conservative_threshold_tbl_all,
+  same_length_conservative_threshold_tbl_ighv,
+  targeted_indel_threshold_tbl_all,
+  targeted_indel_threshold_tbl_ighv
+)
+
+cat("\nThreshold summary preview:\n")
+print(all_threshold_summaries_tbl, n = nrow(all_threshold_summaries_tbl))
+
+write_csv(same_length_all_threshold_tbl, file.path(out_dir, "same_length_hcdr3_threshold_summary.csv"))
+write_csv(same_length_ighv_threshold_tbl, file.path(out_dir, "same_length_hcdr3_plus_ighv_threshold_summary.csv"))
+write_csv(same_length_conservative_threshold_tbl_all, file.path(out_dir, "same_length_hcdr3_conservative_threshold_summary.csv"))
+write_csv(same_length_conservative_threshold_tbl_ighv, file.path(out_dir, "same_length_hcdr3_plus_ighv_conservative_threshold_summary.csv"))
+write_csv(targeted_indel_threshold_tbl_all, file.path(out_dir, "targeted_indel_hcdr3_threshold_summary.csv"))
+write_csv(targeted_indel_threshold_tbl_ighv, file.path(out_dir, "targeted_indel_hcdr3_plus_ighv_threshold_summary.csv"))
+write_csv(all_threshold_summaries_tbl, file.path(out_dir, "all_threshold_summaries_combined.csv"))
+
+# Save threshold-specific hit tables for manual inspection.
+screen_tables <- list(
+  same_length_hcdr3 = same_length_all_tbl,
+  same_length_hcdr3_plus_ighv = same_length_ighv_tbl,
+  same_length_hcdr3_conservative = same_length_all_conservative_tbl,
+  same_length_hcdr3_plus_ighv_conservative = same_length_ighv_conservative_tbl,
+  targeted_indel_hcdr3 = targeted_indel_all_tbl,
+  targeted_indel_hcdr3_plus_ighv = targeted_indel_ighv_tbl
+)
+
+iwalk(screen_tables, function(tbl, nm) {
+  for (thr in similarity_thresholds) {
+    lab <- threshold_label(thr)
+
+    write_csv(
+      tbl %>%
+        filter(!is.na(best_similarity), best_similarity >= thr),
+      file.path(out_dir, paste0(nm, "_hits_ge_", lab, ".csv"))
+    )
+  }
+})
+```
+
+# PRIDE-style CoV-AbDab plots
+
+```{r pride-style-covabdab-plots, fig.width=14, fig.height=8}
+comparison_colors <- c(
+  "HCDR3 only" = "#4E79A7",
+  "HCDR3 plus IGHV" = "#F28E2B",
+  "Indel tolerant HCDR3" = "#59A14F",
+  "Indel tolerant HCDR3 plus IGHV" = "#E15759"
+)
+
+# ============================================================
+# Plot 1. Cells used per JIA joint sample
+# ============================================================
+
+cells_used_tbl <- query_cells %>%
+  count(sample_id, patient_id, tissue, side, name = "n_cells_used") %>%
+  arrange(desc(n_cells_used)) %>%
+  mutate(
+    sample_label = case_when(
+      !is.na(patient_id) & patient_id != "" ~ glue("{sample_id}\n{patient_id}"),
+      TRUE ~ as.character(sample_id)
+    ),
+    sample_label = fct_reorder(sample_label, n_cells_used)
+  )
+
+write_csv(
+  cells_used_tbl,
+  file.path(plot_dir, "cells_used_per_JIA_joint_sample.csv")
+)
+
+p_cells_used <- ggplot(
+  cells_used_tbl,
+  aes(x = sample_label, y = n_cells_used)
+) +
+  geom_col(width = 0.75, fill = "grey35") +
+  geom_text(
+    aes(label = comma(n_cells_used)),
+    hjust = -0.05,
+    size = 4
+  ) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(
+    labels = comma,
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title = "JIA joint VDJ cells used for CoV-AbDab comparison",
+    subtitle = wrap_lab("Only joint samples ending in _LK or _RK are included. Filtering follows the chain-count settings defined above."),
+    x = "JIA joint sample",
+    y = "Cells used"
+  ) +
+  theme_classic(base_size = 16)
+
+print(p_cells_used)
+
+save_plot(
+  p_cells_used,
+  "01_cells_used_per_JIA_joint_sample.png",
+  width = 12,
+  height = 7
+)
+
+# ============================================================
+# Plot 2. Exact overlap summary
+# ============================================================
+
+exact_plot_tbl <- exact_summary_tbl %>%
+  mutate(
+    comparison_short = case_when(
+      comparison == "Exact HCDR3" ~ "HCDR3 only",
+      comparison == "Exact HCDR3 plus IGHV" ~ "HCDR3 plus IGHV",
+      comparison == "Exact paired HCDR3 plus LCDR3" ~ "Paired HCDR3 plus LCDR3",
+      comparison == "Exact paired HCDR3 plus LCDR3 plus IGHV plus IGLV" ~ "Paired HCDR3 plus LCDR3 plus V genes",
+      TRUE ~ comparison
+    ),
+    comparison_short = factor(
+      comparison_short,
+      levels = c(
+        "HCDR3 only",
+        "HCDR3 plus IGHV",
+        "Paired HCDR3 plus LCDR3",
+        "Paired HCDR3 plus LCDR3 plus V genes"
+      )
+    ),
+    pct_query_entries_with_match = as.numeric(pct_query_entries_with_match),
+    n_query_entries_with_match = as.numeric(n_query_entries_with_match),
+    n_query_unique = as.numeric(n_query_unique),
+    label = glue(
+      "{n_query_entries_with_match} / {n_query_unique}\n({clean_pct_label(pct_query_entries_with_match)})"
+    )
+  )
+
+exact_ymax <- max(exact_plot_tbl$pct_query_entries_with_match, na.rm = TRUE)
+
+if (!is.finite(exact_ymax) || exact_ymax == 0) {
+  exact_ymax <- 1
+}
+
+p_exact_summary <- ggplot(
+  exact_plot_tbl,
+  aes(
+    x = fct_rev(comparison_short),
+    y = pct_query_entries_with_match
+  )
+) +
+  geom_col(width = 0.72, fill = "grey35") +
+  geom_text(
+    aes(label = label),
+    hjust = -0.08,
+    size = 4.7,
+    lineheight = 0.92
+  ) +
+  coord_flip(ylim = c(0, exact_ymax * 1.50), clip = "off") +
+  scale_y_continuous(
+    labels = label_percent(scale = 1, accuracy = 0.001),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = "Exact JIA joint overlap with CoV-AbDab",
+    subtitle = wrap_lab("Exact matches are the most conservative result. Each bar shows matched unique query entries divided by all unique query entries for that comparison."),
+    x = NULL,
+    y = "Unique query entries with exact CoV-AbDab match",
+    caption = wrap_lab("Interpretation: HCDR3 only is permissive. Adding IGHV and light-chain information makes the match more specific.")
+  ) +
+  theme_classic(base_size = 17) +
+  theme(
+    plot.caption = element_text(hjust = 0)
+  )
+
+print(p_exact_summary)
+
+save_plot(
+  p_exact_summary,
+  "02_exact_overlap_summary.png",
+  width = 14,
+  height = 7.5
+)
+
+# ============================================================
+# Plot 3. Threshold candidate count curves
+# ============================================================
+
+threshold_plot_tbl <- all_threshold_summaries_tbl %>%
+  mutate(
+    comparison_short = case_when(
+      comparison == "Same length HCDR3" ~ "HCDR3 only",
+      comparison == "Same length HCDR3 plus IGHV" ~ "HCDR3 plus IGHV",
+      comparison == "Targeted indel tolerant HCDR3" ~ "Indel tolerant HCDR3",
+      comparison == "Targeted indel tolerant HCDR3 plus IGHV" ~ "Indel tolerant HCDR3 plus IGHV",
+      TRUE ~ NA_character_
+    ),
+    similarity_threshold = as.numeric(similarity_threshold),
+    n_query_entries_with_match = as.numeric(n_query_entries_with_match),
+    pct_query_entries_with_match = as.numeric(pct_query_entries_with_match),
+    pct_query_cells_covered_by_hit_queries = as.numeric(pct_query_cells_covered_by_hit_queries)
+  ) %>%
+  filter(!is.na(comparison_short)) %>%
+  mutate(
+    comparison_short = factor(
+      comparison_short,
+      levels = names(comparison_colors)
+    ),
+    threshold_label = paste0(round(100 * similarity_threshold), "%")
+  )
+
+p_threshold_counts <- ggplot(
+  threshold_plot_tbl,
+  aes(
+    x = similarity_threshold,
+    y = n_query_entries_with_match,
+    color = comparison_short,
+    group = comparison_short
+  )
+) +
+  geom_line(linewidth = 1.25, na.rm = TRUE) +
+  geom_point(size = 3.6, na.rm = TRUE) +
+  scale_color_manual(values = comparison_colors, drop = FALSE) +
+  scale_x_reverse(
+    breaks = sort(unique(threshold_plot_tbl$similarity_threshold), decreasing = TRUE),
+    labels = function(x) paste0(round(100 * x), "%")
+  ) +
+  scale_y_continuous(
+    labels = label_comma(),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Candidate matches gained by relaxing the similarity threshold",
+    subtitle = wrap_lab("A steep increase at lower thresholds means many weak candidates are being added. IGHV-restricted curves are usually more specific."),
+    x = "Minimum similarity threshold",
+    y = "Unique query entries with\nat least one CoV-AbDab candidate",
+    color = "Screen",
+    caption = wrap_lab("Same-length screens use positional HCDR3 identity. Indel-tolerant screens use edit distance and allow short length differences.")
+  ) +
+  theme_classic(base_size = 17) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    plot.caption = element_text(hjust = 0)
+  )
+
+print(p_threshold_counts)
+
+save_plot(
+  p_threshold_counts,
+  "03_threshold_candidate_count_curves.png",
+  width = 14.5,
+  height = 8.5
+)
+
+# ============================================================
+# Plot 4. Threshold candidate percentage curves
+# ============================================================
+
+p_threshold_percent <- ggplot(
+  threshold_plot_tbl,
+  aes(
+    x = similarity_threshold,
+    y = pct_query_entries_with_match,
+    color = comparison_short,
+    group = comparison_short
+  )
+) +
+  geom_line(linewidth = 1.25, na.rm = TRUE) +
+  geom_point(size = 3.6, na.rm = TRUE) +
+  scale_color_manual(values = comparison_colors, drop = FALSE) +
+  scale_x_reverse(
+    breaks = sort(unique(threshold_plot_tbl$similarity_threshold), decreasing = TRUE),
+    labels = function(x) paste0(round(100 * x), "%")
+  ) +
+  scale_y_continuous(
+    labels = label_percent(scale = 1, accuracy = 0.001),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Fraction of JIA query entries with a CoV-AbDab candidate",
+    subtitle = wrap_lab("Same information as the count curve, normalized to the number of query entries."),
+    x = "Minimum similarity threshold",
+    y = "Query entries with candidate match",
+    color = "Screen",
+    caption = wrap_lab("Percentages can look small even when the absolute number of candidates is biologically worth inspecting.")
+  ) +
+  theme_classic(base_size = 17) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    plot.caption = element_text(hjust = 0)
+  )
+
+print(p_threshold_percent)
+
+save_plot(
+  p_threshold_percent,
+  "04_threshold_candidate_percent_curves.png",
+  width = 14.5,
+  height = 8.5
+)
+
+# ============================================================
+# Plot 5. Cell coverage by threshold
+# ============================================================
+
+p_threshold_cell_coverage <- ggplot(
+  threshold_plot_tbl,
+  aes(
+    x = similarity_threshold,
+    y = pct_query_cells_covered_by_hit_queries,
+    color = comparison_short,
+    group = comparison_short
+  )
+) +
+  geom_line(linewidth = 1.25, na.rm = TRUE) +
+  geom_point(size = 3.6, na.rm = TRUE) +
+  scale_color_manual(values = comparison_colors, drop = FALSE) +
+  scale_x_reverse(
+    breaks = sort(unique(threshold_plot_tbl$similarity_threshold), decreasing = TRUE),
+    labels = function(x) paste0(round(100 * x), "%")
+  ) +
+  scale_y_continuous(
+    labels = label_percent(scale = 1, accuracy = 0.001),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Fraction of JIA cells covered by candidate query entries",
+    subtitle = wrap_lab("Cell-weighted view: each unique HCDR3 is weighted by the number of JIA cells carrying it."),
+    x = "Minimum similarity threshold",
+    y = "Cells covered by candidate query entries",
+    color = "Screen",
+    caption = wrap_lab("This helps distinguish single-cell singleton candidates from candidates carried by larger or repeated JIA clonotypes.")
+  ) +
+  theme_classic(base_size = 17) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    plot.caption = element_text(hjust = 0)
+  )
+
+print(p_threshold_cell_coverage)
+
+save_plot(
+  p_threshold_cell_coverage,
+  "05_threshold_cell_coverage_curves.png",
+  width = 14.5,
+  height = 8.5
+)
+
+# ============================================================
+# Build candidate tables for individual match figures
+# ============================================================
+
+prep_same_length_candidates <- function(tbl, screen_label, uses_ighv) {
+  tbl %>%
+    mutate(
+      screen = screen_label,
+      uses_ighv = uses_ighv,
+      query_hcdr3 = as.character(query_hcdr3),
+      best_db_hcdr3 = as.character(best_db_hcdr3),
+      heavy_v_gene = if ("heavy_v_gene" %in% colnames(.)) as.character(heavy_v_gene) else NA_character_,
+      best_similarity = as.numeric(best_similarity),
+      distance_to_db = as.numeric(aa_differences),
+      distance_label = if_else(
+        is.na(distance_to_db),
+        NA_character_,
+        paste0(distance_to_db, " aa difference(s)")
+      ),
+      comparison_type = "Same length positional identity",
+      length_difference = 0,
+      total_edit_ops = NA_real_,
+      n_cells_in_your_data = as.numeric(n_cells_in_your_data),
+      n_samples_in_your_data = as.numeric(n_samples_in_your_data)
+    ) %>%
+    select(
+      screen, uses_ighv, comparison_type,
+      query_hcdr3, heavy_v_gene, best_db_hcdr3,
+      best_similarity, distance_to_db, distance_label,
+      length_difference, total_edit_ops,
+      n_cells_in_your_data, n_samples_in_your_data,
+      n_patients_in_your_data,
+      sample_ids_in_your_data,
+      patient_ids_in_your_data,
+      tissues_in_your_data,
+      sides_in_your_data,
+      isotypes_in_your_data,
+      clonotype_ids_in_your_data,
+      clonotype_ids_10x_in_your_data,
+      max_clonotype_frequency_in_your_data,
+      matched_covabdab_names,
+      matched_covabdab_targets,
+      matched_covabdab_neutralising_vs,
+      matched_covabdab_epitopes,
+      matched_covabdab_origins
+    )
+}
+
+prep_indel_candidates <- function(tbl, screen_label, uses_ighv) {
+  tbl %>%
+    mutate(
+      screen = screen_label,
+      uses_ighv = uses_ighv,
+      query_hcdr3 = as.character(query_hcdr3),
+      best_db_hcdr3 = as.character(best_db_hcdr3),
+      heavy_v_gene = if ("heavy_v_gene" %in% colnames(.)) as.character(heavy_v_gene) else NA_character_,
+      best_similarity = as.numeric(best_similarity),
+      total_edit_ops = as.numeric(total_edit_ops),
+      length_difference = as.numeric(length_difference),
+      distance_to_db = total_edit_ops,
+      distance_label = if_else(
+        is.na(total_edit_ops),
+        NA_character_,
+        paste0(total_edit_ops, " edit operation(s)")
+      ),
+      comparison_type = "Indel tolerant edit distance",
+      n_cells_in_your_data = as.numeric(n_cells_in_your_data),
+      n_samples_in_your_data = as.numeric(n_samples_in_your_data)
+    ) %>%
+    select(
+      screen, uses_ighv, comparison_type,
+      query_hcdr3, heavy_v_gene, best_db_hcdr3,
+      best_similarity, distance_to_db, distance_label,
+      length_difference, total_edit_ops,
+      n_cells_in_your_data, n_samples_in_your_data,
+      n_patients_in_your_data,
+      sample_ids_in_your_data,
+      patient_ids_in_your_data,
+      tissues_in_your_data,
+      sides_in_your_data,
+      isotypes_in_your_data,
+      clonotype_ids_in_your_data,
+      clonotype_ids_10x_in_your_data,
+      max_clonotype_frequency_in_your_data,
+      matched_covabdab_names,
+      matched_covabdab_targets,
+      matched_covabdab_neutralising_vs,
+      matched_covabdab_epitopes,
+      matched_covabdab_origins
+    )
+}
+
+candidate_tbl <- bind_rows(
+  prep_same_length_candidates(
+    same_length_all_tbl,
+    screen_label = "HCDR3 only",
+    uses_ighv = FALSE
+  ),
+  prep_same_length_candidates(
+    same_length_ighv_tbl,
+    screen_label = "HCDR3 plus IGHV",
+    uses_ighv = TRUE
+  ),
+  prep_indel_candidates(
+    targeted_indel_all_tbl,
+    screen_label = "Indel tolerant HCDR3",
+    uses_ighv = FALSE
+  ),
+  prep_indel_candidates(
+    targeted_indel_ighv_tbl,
+    screen_label = "Indel tolerant HCDR3 plus IGHV",
+    uses_ighv = TRUE
+  )
+) %>%
+  filter(
+    !is.na(best_similarity),
+    !is.na(best_db_hcdr3)
+  ) %>%
+  mutate(
+    screen = factor(screen, levels = names(comparison_colors)),
+    query_hcdr3_short = shorten_sequence(query_hcdr3),
+    best_db_hcdr3_short = shorten_sequence(best_db_hcdr3),
+    candidate_label = case_when(
+      !is.na(heavy_v_gene) & heavy_v_gene != "" ~ glue("{query_hcdr3_short}\n{heavy_v_gene}"),
+      TRUE ~ query_hcdr3_short
+    ),
+    evidence_tier = case_when(
+      best_similarity == 1 ~ "Exact HCDR3 sequence match",
+      best_similarity >= 0.95 ~ "Very high similarity",
+      best_similarity >= 0.90 ~ "High similarity",
+      best_similarity >= 0.80 ~ "Moderate similarity",
+      TRUE ~ "Low similarity"
+    ),
+    evidence_tier = factor(
+      evidence_tier,
+      levels = c(
+        "Exact HCDR3 sequence match",
+        "Very high similarity",
+        "High similarity",
+        "Moderate similarity",
+        "Low similarity"
+      )
+    )
+  )
+
+write_csv(
+  candidate_tbl,
+  file.path(plot_dir, "all_best_candidate_matches_for_plotting.csv")
+)
+
+# ============================================================
+# Plot 6. Candidate similarity landscape
+# ============================================================
+
+candidate_landscape_tbl <- candidate_tbl %>%
+  mutate(
+    plot_distance = if_else(
+      is.na(distance_to_db),
+      NA_real_,
+      distance_to_db
+    )
+  ) %>%
+  filter(!is.na(plot_distance))
+
+if (nrow(candidate_landscape_tbl) > 0) {
+  p_candidate_landscape <- ggplot(
+    candidate_landscape_tbl,
+    aes(
+      x = plot_distance,
+      y = best_similarity,
+      size = n_cells_in_your_data,
+      color = n_samples_in_your_data
+    )
+  ) +
+    geom_hline(
+      yintercept = 0.90,
+      linetype = "dashed",
+      linewidth = 0.5,
+      color = "grey65"
+    ) +
+    geom_hline(
+      yintercept = 0.95,
+      linetype = "dashed",
+      linewidth = 0.5,
+      color = "grey65"
+    ) +
+    geom_hline(
+      yintercept = 1.00,
+      linetype = "solid",
+      linewidth = 0.6,
+      color = "grey65"
+    ) +
+    geom_point(alpha = 0.75, na.rm = TRUE) +
+    facet_wrap(~ screen, scales = "free_x") +
+    scale_y_continuous(
+      labels = label_percent(accuracy = 1),
+      limits = c(0, 1),
+      expand = expansion(mult = c(0.02, 0.05))
+    ) +
+    scale_x_continuous(
+      breaks = pretty_breaks(n = 6)
+    ) +
+    scale_size_continuous(
+      range = c(2, 9),
+      breaks = pretty_breaks(n = 4)
+    ) +
+    scale_color_viridis_c(
+      option = "C",
+      breaks = pretty_breaks(n = 4)
+    ) +
+    labs(
+      title = "Individual best CoV-AbDab candidate per JIA query sequence",
+      subtitle = wrap_lab("Each point is one query sequence with its best database match. Larger points are supported by more cells in your JIA data."),
+      x = "Distance to best database match",
+      y = "Similarity to best database match",
+      size = "JIA cells",
+      color = "JIA samples",
+      caption = wrap_lab("For same-length screens, distance means amino acid differences. For indel-tolerant screens, distance means total edit operations.")
+    ) +
+    theme_classic(base_size = 17) +
+    theme(
+      legend.position = "right",
+      plot.caption = element_text(hjust = 0)
+    )
+} else {
+  p_candidate_landscape <- ggplot() +
+    annotate(
+      "text",
+      x = 0,
+      y = 0,
+      label = "No candidate matches were available for the landscape plot.",
+      size = 6
+    ) +
+    labs(
+      title = "Individual best CoV-AbDab candidate per JIA query sequence",
+      subtitle = "No candidate rows available."
+    ) +
+    theme_void(base_size = 17)
+}
+
+print(p_candidate_landscape)
+
+save_plot(
+  p_candidate_landscape,
+  "06_candidate_similarity_landscape.png",
+  width = 15.5,
+  height = 9.5
+)
+
+# ============================================================
+# Plot 7. Top strict IGHV-restricted candidates
+# ============================================================
+
+top_candidate_tbl <- candidate_tbl %>%
+  filter(
+    uses_ighv,
+    best_similarity >= candidate_min_similarity
+  ) %>%
+  arrange(
+    desc(best_similarity),
+    distance_to_db,
+    desc(n_cells_in_your_data),
+    desc(n_samples_in_your_data),
+    query_hcdr3
+  ) %>%
+  mutate(
+    rank_overall = row_number()
+  ) %>%
+  slice_head(n = top_n_candidates) %>%
+  mutate(
+    candidate_label_ranked = glue(
+      "#{rank_overall}: {query_hcdr3_short}"
+    ),
+    candidate_label_ranked = fct_reorder(candidate_label_ranked, best_similarity),
+    db_label = shorten_sequence(best_db_hcdr3, max_width = 22),
+    point_label = glue(
+      "{distance_label}; {n_cells_in_your_data} cell(s); {n_samples_in_your_data} sample(s)"
+    )
+  )
+
+write_csv(
+  top_candidate_tbl,
+  file.path(plot_dir, glue("top_{top_n_candidates}_strict_candidate_matches.csv"))
+)
+
+if (nrow(top_candidate_tbl) > 0) {
+  x_min_top <- max(
+    0.80,
+    min(top_candidate_tbl$best_similarity, na.rm = TRUE) - 0.03
+  )
+
+  p_top_candidates <- ggplot(
+    top_candidate_tbl,
+    aes(
+      x = best_similarity,
+      y = candidate_label_ranked,
+      color = screen,
+      size = n_cells_in_your_data
+    )
+  ) +
+    geom_vline(
+      xintercept = 0.90,
+      linetype = "dashed",
+      linewidth = 0.5,
+      color = "grey70"
+    ) +
+    geom_vline(
+      xintercept = 0.95,
+      linetype = "dashed",
+      linewidth = 0.5,
+      color = "grey70"
+    ) +
+    geom_vline(
+      xintercept = 1.00,
+      linetype = "solid",
+      linewidth = 0.6,
+      color = "grey70"
+    ) +
+    geom_point(alpha = 0.85) +
+    geom_text(
+      aes(label = point_label),
+      hjust = -0.05,
+      size = 4.2,
+      color = "grey20"
+    ) +
+    scale_color_manual(values = comparison_colors, drop = FALSE) +
+    scale_x_continuous(
+      labels = label_percent(accuracy = 1),
+      breaks = c(0.80, 0.85, 0.90, 0.95, 1.00),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    coord_cartesian(
+      xlim = c(x_min_top, 1.17),
+      clip = "off"
+    ) +
+    scale_size_continuous(range = c(3, 9)) +
+    labs(
+      title = glue("Top {nrow(top_candidate_tbl)} strict JIA candidate matches to CoV-AbDab"),
+      subtitle = wrap_lab(glue("Only IGHV-restricted screens with similarity at least {round(100 * candidate_min_similarity)}% are shown.")),
+      x = "Similarity to best database match",
+      y = "JIA query HCDR3",
+      color = "Screen",
+      size = "JIA cells",
+      caption = wrap_lab("These are candidates for manual inspection. Similar HCDR3 plus same IGHV is more specific than HCDR3-only similarity, but still does not prove identical antigen specificity.")
+    ) +
+    theme_classic(base_size = 17) +
+    theme(
+      axis.text.y = element_text(size = 13),
+      legend.position = "bottom",
+      legend.box = "vertical",
+      plot.caption = element_text(hjust = 0),
+      plot.margin = margin(10, 130, 10, 10)
+    )
+} else {
+  p_top_candidates <- ggplot() +
+    annotate(
+      "text",
+      x = 0,
+      y = 0,
+      label = glue(
+        "No IGHV-restricted candidate matches passed the {round(100 * candidate_min_similarity)}% similarity cutoff."
+      ),
+      size = 6
+    ) +
+    labs(
+      title = "Top strict JIA candidate matches to CoV-AbDab",
+      subtitle = "No candidates passed the selected cutoff."
+    ) +
+    theme_void(base_size = 17)
+}
+
+print(p_top_candidates)
+
+save_plot(
+  p_top_candidates,
+  "07_top_strict_candidate_matches.png",
+  width = 15.5,
+  height = 10.5
+)
+
+# ============================================================
+# Plot 8. Exact hit details if present
+# ============================================================
+
+exact_hit_detail_tbl <- bind_rows(
+  hits_exact_hcdr3 %>%
+    mutate(exact_screen = "Exact HCDR3"),
+  hits_exact_hcdr3_ighv %>%
+    mutate(exact_screen = "Exact HCDR3 plus IGHV"),
+  hits_exact_pair %>%
+    mutate(exact_screen = "Exact paired HCDR3 plus LCDR3"),
+  hits_exact_pair_v %>%
+    mutate(exact_screen = "Exact paired HCDR3 plus LCDR3 plus V genes")
+) %>%
+  mutate(
+    exact_screen = factor(
+      exact_screen,
+      levels = c(
+        "Exact HCDR3",
+        "Exact HCDR3 plus IGHV",
+        "Exact paired HCDR3 plus LCDR3",
+        "Exact paired HCDR3 plus LCDR3 plus V genes"
+      )
+    )
+  )
+
+write_csv(
+  exact_hit_detail_tbl,
+  file.path(plot_dir, "all_exact_hit_details_combined.csv")
+)
+
+if (nrow(exact_hit_detail_tbl) > 0) {
+  exact_hit_plot_tbl <- exact_hit_detail_tbl %>%
+    mutate(
+      hcdr3_short = if ("hcdr3" %in% colnames(.)) shorten_sequence(hcdr3, max_width = 22) else NA_character_,
+      plot_label = case_when(
+        !is.na(hcdr3_short) ~ glue("{hcdr3_short}\n{exact_screen}"),
+        TRUE ~ paste0("hit_", row_number())
+      ),
+      n_cells_in_your_data = as.numeric(n_cells_in_your_data),
+      n_samples_in_your_data = as.numeric(n_samples_in_your_data)
+    ) %>%
+    arrange(desc(n_cells_in_your_data), desc(n_samples_in_your_data)) %>%
+    slice_head(n = 25) %>%
+    mutate(
+      plot_label = fct_reorder(plot_label, n_cells_in_your_data)
+    )
+
+  exact_detail_xmax <- max(exact_hit_plot_tbl$n_cells_in_your_data, na.rm = TRUE)
+
+  if (!is.finite(exact_detail_xmax) || exact_detail_xmax == 0) {
+    exact_detail_xmax <- 1
+  }
+
+  p_exact_hits_detail <- ggplot(
+    exact_hit_plot_tbl,
+    aes(
+      x = n_cells_in_your_data,
+      y = plot_label,
+      fill = exact_screen
+    )
+  ) +
+    geom_col(width = 0.72) +
+    geom_text(
+      aes(
+        label = glue("{n_cells_in_your_data} cell(s), {n_samples_in_your_data} sample(s)")
+      ),
+      hjust = -0.05,
+      size = 4.2
+    ) +
+    coord_cartesian(
+      xlim = c(0, exact_detail_xmax * 1.55),
+      clip = "off"
+    ) +
+    labs(
+      title = "Exact CoV-AbDab hit details in JIA joints",
+      subtitle = wrap_lab("Top exact matching query entries ranked by number of cells in your JIA data."),
+      x = "JIA cells",
+      y = "Query HCDR3 and exact screen",
+      fill = "Exact screen",
+      caption = wrap_lab("Exact HCDR3 plus IGHV or paired-chain matches are more specific than HCDR3-only matches.")
+    ) +
+    theme_classic(base_size = 17) +
+    theme(
+      axis.text.y = element_text(size = 13),
+      legend.position = "bottom",
+      legend.box = "vertical",
+      plot.caption = element_text(hjust = 0),
+      plot.margin = margin(10, 130, 10, 10)
+    )
+} else {
+  p_exact_hits_detail <- ggplot() +
+    annotate(
+      "text",
+      x = 0,
+      y = 0,
+      label = "No exact hit detail rows were found.",
+      size = 6
+    ) +
+    labs(
+      title = "Exact CoV-AbDab hit details in JIA joints",
+      subtitle = "No exact hit rows available."
+    ) +
+    theme_void(base_size = 17)
+}
+
+print(p_exact_hits_detail)
+
+save_plot(
+  p_exact_hits_detail,
+  "08_exact_hit_details_if_present.png",
+  width = 15.5,
+  height = 9.5
+)
+
+# ============================================================
+# Optional combined overview
+# ============================================================
+
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  p_combined <- (
+    p_exact_summary /
+      p_threshold_counts /
+      p_candidate_landscape
+  ) +
+    patchwork::plot_annotation(
+      title = "Scientific summary of JIA joint antibody overlap with CoV-AbDab",
+      subtitle = wrap_lab("Exact overlap, threshold behaviour, and individual candidate landscape")
+    ) &
+    theme(
+      plot.title = element_text(size = 24, face = "bold"),
+      plot.subtitle = element_text(size = 17)
+    )
+
+  print(p_combined)
+
+  save_plot(
+    p_combined,
+    "00_combined_main_scientific_overview.png",
+    width = 16,
+    height = 22
+  )
+} else {
+  cat("\nPackage 'patchwork' is not installed, so combined overview was skipped.\n")
+}
+```
+
+# Save figure guide and final log
+
+```{r save-figure-guide-and-final-log}
+figure_guide <- c(
+  "Figure guide for JIA joint CoV-AbDab overlap summary",
+  "",
+  "00_combined_main_scientific_overview.png",
+  "Combined summary if patchwork is installed.",
+  "",
+  "01_cells_used_per_JIA_joint_sample.png",
+  "Shows how many JIA joint VDJ cells entered the CoV-AbDab comparison.",
+  "",
+  "02_exact_overlap_summary.png",
+  "Strongest figure. Shows exact overlap for increasingly strict definitions.",
+  "",
+  "03_threshold_candidate_count_curves.png",
+  "Shows how many candidate matches appear as similarity thresholds are relaxed.",
+  "",
+  "04_threshold_candidate_percent_curves.png",
+  "Same as figure 03, normalized to the number of query entries.",
+  "",
+  "05_threshold_cell_coverage_curves.png",
+  "Cell-weighted view of threshold behaviour.",
+  "",
+  "06_candidate_similarity_landscape.png",
+  "Shows individual best database matches. Good candidates should be high similarity and low distance.",
+  "",
+  "07_top_strict_candidate_matches.png",
+  "Most useful manual-inspection figure. Only IGHV-restricted candidate matches above the selected cutoff are shown.",
+  "",
+  "08_exact_hit_details_if_present.png",
+  "Only useful if exact hits exist. Shows which exact hits are supported by the most cells.",
+  "",
+  "Scientific interpretation notes:",
+  "Exact matches are strongest.",
+  "HCDR3 plus IGHV is more specific than HCDR3 alone.",
+  "Paired heavy plus light chain exact matches are most specific when present.",
+  "Relaxed similarity hits should be treated as candidates, not as proof of shared antigen specificity.",
+  "Conservative substitution and indel-tolerant screens are exploratory candidate-generation screens."
+)
+
+writeLines(
+  figure_guide,
+  file.path(plot_dir, "README_figure_interpretation.txt")
+)
+
+plot_manifest <- tibble(
+  plot_name = c(
+    "Combined main scientific overview",
+    "Cells used per JIA joint sample",
+    "Exact overlap summary",
+    "Threshold candidate count curves",
+    "Threshold candidate percent curves",
+    "Threshold cell coverage curves",
+    "Candidate similarity landscape",
+    "Top strict candidate matches",
+    "Exact hit details if present"
+  ),
+  saved_file = c(
+    "00_combined_main_scientific_overview.png",
+    "01_cells_used_per_JIA_joint_sample.png",
+    "02_exact_overlap_summary.png",
+    "03_threshold_candidate_count_curves.png",
+    "04_threshold_candidate_percent_curves.png",
+    "05_threshold_cell_coverage_curves.png",
+    "06_candidate_similarity_landscape.png",
+    "07_top_strict_candidate_matches.png",
+    "08_exact_hit_details_if_present.png"
+  )
+)
+
+write_csv(
+  plot_manifest,
+  file.path(plot_dir, "plot_manifest.csv")
+)
+
+cat("\nFinished JIA joint CoV-AbDab comparison.\n")
+cat("\nTables saved to:\n")
+cat(out_dir, "\n")
+cat("\nPlots saved to:\n")
+cat(plot_dir, "\n")
+```
